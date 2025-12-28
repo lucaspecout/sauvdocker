@@ -690,10 +690,20 @@ def dashboard():
         backups = conn.execute(
             "SELECT id, target_type, target_name, file_path, created_at, status, error_message FROM backups ORDER BY created_at DESC"
         ).fetchall()
+    container_backups = {}
+    for backup in backups:
+        if backup[1] != "container":
+            continue
+        container_backups.setdefault(backup[2], []).append(backup)
+    latest_container_backups = {
+        name: history[0] for name, history in container_backups.items() if history
+    }
     return render_template(
         "dashboard.html",
         containers=containers,
         backups=backups,
+        container_backups=container_backups,
+        latest_container_backups=latest_container_backups,
         schedules=schedules,
         week_days=week_days,
         force_password_change=current_user.force_password_change,
@@ -927,6 +937,32 @@ def schedule_container(container_id):
 @login_required
 def download_backup(filename):
     return send_from_directory(BACKUP_DIR, filename, as_attachment=True)
+
+
+@app.route("/backup/delete", methods=["POST"])
+@login_required
+def delete_backup():
+    backup_id = request.form.get("backup_id")
+    if not backup_id:
+        flash("Sauvegarde introuvable.", "error")
+        return redirect(url_for("dashboard"))
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT file_path FROM backups WHERE id = ?", (backup_id,)).fetchone()
+        if not row:
+            flash("Sauvegarde introuvable.", "error")
+            return redirect(url_for("dashboard"))
+        conn.execute("DELETE FROM backups WHERE id = ?", (backup_id,))
+        conn.commit()
+    file_path = row[0]
+    if file_path:
+        try:
+            path_obj = Path(file_path)
+            if path_obj.exists():
+                path_obj.unlink()
+        except OSError as exc:
+            log_docker_event(f"backup_delete_error path={file_path} error={exc}", logging.WARNING)
+    flash("Sauvegarde supprimée.", "success")
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/settings", methods=["GET", "POST"])

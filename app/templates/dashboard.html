@@ -25,11 +25,54 @@
             <h4>{{ container.name }}</h4>
             <p>ID: {{ container.short_id }}</p>
             <p>Status: {{ container.status }}</p>
+            {% set last_backup = latest_container_backups.get(container.name) %}
+            {% if last_backup %}
+              <p class="backup-summary">
+                Dernière sauvegarde : {{ last_backup[4] }}
+                <span class="status {{ last_backup[5] }}">{{ last_backup[5] }}</span>
+              </p>
+            {% else %}
+              <p class="backup-summary">Dernière sauvegarde : aucune</p>
+            {% endif %}
           </div>
           <div class="card-actions">
             <form method="post" action="{{ url_for('backup_container_route', container_id=container.id) }}">
               <button type="submit">Sauvegarder</button>
             </form>
+            <details class="history-details">
+              <summary>Historique</summary>
+              {% set history = container_backups.get(container.name, []) %}
+              <div class="table compact">
+                <div class="table-row header">
+                  <span>Type</span>
+                  <span>Nom</span>
+                  <span>Date</span>
+                  <span>Statut</span>
+                  <span>Actions</span>
+                </div>
+                {% for backup in history %}
+                  <div class="table-row">
+                    <span>{{ backup[1] }}</span>
+                    <span>{{ backup[2] }}</span>
+                    <span>{{ backup[4] }}</span>
+                    <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+                    <span class="actions">
+                      <a href="{{ url_for('download_backup', filename=backup[3].split('/')[-1]) }}">Télécharger</a>
+                      <form method="post" action="{{ url_for('restore_backup') }}">
+                        <input type="hidden" name="backup_id" value="{{ backup[0] }}">
+                        <button type="submit">Restaurer</button>
+                      </form>
+                      <form method="post" action="{{ url_for('delete_backup') }}">
+                        <input type="hidden" name="backup_id" value="{{ backup[0] }}">
+                        <button type="submit" class="danger">Supprimer</button>
+                      </form>
+                    </span>
+                  </div>
+                {% else %}
+                  <p>Aucune sauvegarde encore.</p>
+                {% endfor %}
+              </div>
+            </details>
             {% set schedule = schedules.get(container.name) %}
             {% if schedule %}
               {% set day_labels = namespace(items=[]) %}
@@ -98,6 +141,10 @@
           <form method="post" action="{{ url_for('restore_backup') }}">
             <input type="hidden" name="backup_id" value="{{ backup[0] }}">
             <button type="submit">Restaurer</button>
+          </form>
+          <form method="post" action="{{ url_for('delete_backup') }}">
+            <input type="hidden" name="backup_id" value="{{ backup[0] }}">
+            <button type="submit" class="danger">Supprimer</button>
           </form>
           <form method="post" action="{{ url_for('manual_drive_transfer') }}">
             <input type="hidden" name="backup_id" value="{{ backup[0] }}">
