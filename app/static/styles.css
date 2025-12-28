@@ -295,6 +295,19 @@ label {
   word-break: break-all;
 }
 
+.mfa-qr {
+  display: flex;
+  justify-content: center;
+  padding: 8px;
+  background: #ffffff;
+  border-radius: 12px;
+}
+
+.mfa-qr img {
+  width: 180px;
+  height: 180px;
+}
+
 @media (max-width: 960px) {
   .app-shell {
     grid-template-columns: 1fr;
