@@ -28,7 +28,14 @@ login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.init_app(app)
 
-docker_client = docker.from_env()
+def get_docker_client():
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host.startswith("http+docker://"):
+        os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+    return docker.from_env()
+
+
+docker_client = get_docker_client()
 
 scheduler = BackgroundScheduler()
 
