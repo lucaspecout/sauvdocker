@@ -1,0 +1,47 @@
+version: "3.9"
+services:
+  api:
+    build: ./api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./api/app:/app/app
+      - ./api/alembic:/app/alembic
+      - ./api/alembic.ini:/app/alembic.ini
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backups:/data/backups
+    environment:
+      DATABASE_URL: postgresql+psycopg2://dockback:dockback@postgres:5432/dockback
+      REDIS_URL: redis://redis:6379/0
+      DOCKBACK_DATA_DIR: /data/backups
+      DOCKBACK_SECRET_KEY: dev-secret
+      DOCKBACK_BASE_URL: "http://localhost:8080"
+      DOCKBACK_ENCRYPTION_KEY_FILE: /run/secrets/dockback_encryption_key
+
+  worker:
+    build: ./worker
+    command: celery -A app.celery_app worker -l info
+    volumes:
+      - ./worker/app:/app/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backups:/data/backups
+    environment:
+      DATABASE_URL: postgresql+psycopg2://dockback:dockback@postgres:5432/dockback
+      REDIS_URL: redis://redis:6379/0
+      DOCKBACK_DATA_DIR: /data/backups
+      DOCKBACK_ENCRYPTION_KEY_FILE: /run/secrets/dockback_encryption_key
+
+  web:
+    build:
+      context: ./web
+      target: dev
+    command: npm run dev -- --host 0.0.0.0 --port 5173
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: "http://localhost:8080"
+
+volumes:
+  backups:
