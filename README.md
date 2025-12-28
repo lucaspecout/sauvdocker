@@ -23,3 +23,7 @@ Vous devrez changer ce mot de passe lors de la première connexion et configurer
 ## Notes de sécurité
 - Montez uniquement le socket Docker dans un environnement contrôlé.
 - Changez `APP_SECRET` et le mot de passe admin immédiatement.
+
+## Persistance des données
+Les données applicatives (comptes, MFA, sauvegardes) sont stockées dans des volumes Docker nommés
+afin d'éviter la perte du compte admin entre deux redémarrages.
