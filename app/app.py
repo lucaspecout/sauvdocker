@@ -249,6 +249,13 @@ def set_setting(key, value):
         conn.commit()
 
 
+def get_int_setting(key, default):
+    try:
+        return int(get_setting(key, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def send_alert(subject, message):
     smtp_host = get_setting("smtp_host")
     smtp_port = get_setting("smtp_port")
@@ -297,6 +304,32 @@ def record_backup(target_type, target_name, file_path, status, error_message=Non
         conn.commit()
 
 
+def cleanup_old_backups(max_keep):
+    if max_keep is None or max_keep <= 0:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, file_path FROM backups ORDER BY created_at DESC LIMIT -1 OFFSET ?",
+            (max_keep,),
+        ).fetchall()
+        if not rows:
+            return
+        backup_ids = [row[0] for row in rows]
+        file_paths = [row[1] for row in rows]
+        conn.execute(
+            "DELETE FROM backups WHERE id IN ({})".format(",".join("?" * len(backup_ids))),
+            backup_ids,
+        )
+        conn.commit()
+    for file_path in file_paths:
+        try:
+            path_obj = Path(file_path)
+            if path_obj.exists():
+                path_obj.unlink()
+        except OSError as exc:
+            log_docker_event(f"backup_cleanup_error path={file_path} error={exc}", logging.WARNING)
+
+
 def backup_container(container_id, name=None, client=None):
     client = client or ensure_docker_client()
     if not client:
@@ -309,6 +342,7 @@ def backup_container(container_id, name=None, client=None):
             for chunk in container.export():
                 fh.write(chunk)
         record_backup("container", name or container.name, str(file_path), "success")
+        cleanup_old_backups(get_int_setting("backup_retention", 20))
         run_drive_transfer(str(file_path))
         send_alert("Sauvegarde container réussie", f"Sauvegarde créée pour {name or container.name}")
         return True
@@ -331,6 +365,7 @@ def backup_image(image_id, name=None, client=None):
             for chunk in image_data:
                 fh.write(chunk)
         record_backup("image", name or image.short_id, str(file_path), "success")
+        cleanup_old_backups(get_int_setting("backup_retention", 20))
         run_drive_transfer(str(file_path))
         send_alert("Sauvegarde image réussie", f"Sauvegarde créée pour {name or image.short_id}")
         return True
@@ -338,6 +373,20 @@ def backup_image(image_id, name=None, client=None):
         record_backup("image", name or image.short_id, str(file_path), "failed", str(exc))
         send_alert("Sauvegarde image échouée", f"Erreur pour {name or image.short_id}: {exc}")
         return False
+
+
+def import_container_backup(file_path, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    before_images = {image.id for image in client.images.list()}
+    with open(file_path, "rb") as fh:
+        client.api.import_image(fh.read())
+    after_images = client.images.list()
+    new_images = [image for image in after_images if image.id not in before_images]
+    if not new_images:
+        raise RuntimeError("Import de l'image échoué.")
+    return new_images[0]
 
 
 def scheduled_backup():
@@ -355,7 +404,7 @@ def scheduled_backup():
 
 def refresh_scheduler():
     scheduler.remove_all_jobs()
-    interval_minutes = int(get_setting("backup_interval", "60"))
+    interval_minutes = get_int_setting("backup_interval", 60)
     scheduler.add_job(scheduled_backup, "interval", minutes=interval_minutes, id="auto_backup")
 
 
@@ -541,8 +590,7 @@ def restore_backup():
             with open(file_path, "rb") as fh:
                 client.images.load(fh.read())
         else:
-            with open(file_path, "rb") as fh:
-                image = client.images.import_image(fh.read())
+            image = import_container_backup(file_path, client=client)
             client.containers.run(image.id, detach=True)
         flash("Restauration déclenchée.", "success")
     except docker.errors.DockerException as exc:
@@ -564,6 +612,7 @@ def download_backup(filename):
 def settings():
     if request.method == "POST":
         set_setting("backup_interval", request.form.get("backup_interval", "60"))
+        set_setting("backup_retention", request.form.get("backup_retention", "20"))
         set_setting("smtp_host", request.form.get("smtp_host"))
         set_setting("smtp_port", request.form.get("smtp_port"))
         set_setting("smtp_user", request.form.get("smtp_user"))
@@ -576,6 +625,7 @@ def settings():
         return redirect(url_for("settings"))
     context = {
         "backup_interval": get_setting("backup_interval", "60"),
+        "backup_retention": get_setting("backup_retention", "20"),
         "smtp_host": get_setting("smtp_host", ""),
         "smtp_port": get_setting("smtp_port", ""),
         "smtp_user": get_setting("smtp_user", ""),
