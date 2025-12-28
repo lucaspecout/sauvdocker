@@ -1,6 +1,7 @@
 Flask==3.0.0
 Flask-Login==0.6.3
 docker==7.0.0
+requests-unixsocket==0.3.0
 pyotp==2.9.0
 APScheduler==3.10.4
 Werkzeug==3.0.1
