@@ -381,7 +381,8 @@ def backup_container(container_id, name=None, client=None, retention=None):
                 if not volume_name or not destination:
                     continue
                 volume_tar_path = volumes_dir / f"{volume_name}.tar"
-                archive_stream, _ = container.get_archive(destination)
+                archive_path = f"{destination.rstrip('/')}/."
+                archive_stream, _ = container.get_archive(archive_path)
                 with open(volume_tar_path, "wb") as fh:
                     for chunk in archive_stream:
                         fh.write(chunk)
@@ -588,6 +589,32 @@ def remove_images_by_tags(client, image_tags):
             log_docker_event(f"image_remove_error tag={tag} error={exc}", logging.WARNING)
 
 
+def normalize_volume_archive(archive_path, destination, temp_dir):
+    destination_name = Path(destination.rstrip("/")).name
+    if not destination_name:
+        return archive_path
+    extract_dir = temp_dir / f"volume-{destination_name}"
+    try:
+        with tarfile.open(archive_path, "r") as tar:
+            members = [member for member in tar.getmembers() if member.name not in (".", "./")]
+            if not members:
+                return archive_path
+            top_levels = {member.name.split("/")[0] for member in members if member.name}
+            if len(top_levels) != 1 or destination_name not in top_levels:
+                return archive_path
+            tar.extractall(path=extract_dir)
+        source_dir = extract_dir / destination_name
+        if not source_dir.exists():
+            return archive_path
+        normalized_path = extract_dir / "normalized.tar"
+        with tarfile.open(normalized_path, "w") as tar:
+            for item in source_dir.rglob("*"):
+                tar.add(item, arcname=item.relative_to(source_dir))
+        return normalized_path
+    except (tarfile.TarError, OSError):
+        return archive_path
+
+
 def restore_container_bundle(file_path, client=None):
     client = client or ensure_docker_client()
     if not client:
@@ -626,13 +653,14 @@ def restore_container_bundle(file_path, client=None):
             archive_path = temp_dir / "volumes" / f"{volume_name}.tar"
             if not archive_path.exists():
                 continue
+            normalized_archive_path = normalize_volume_archive(archive_path, destination, temp_dir)
             helper_container = client.containers.create(
                 helper_image.id,
                 command=["sleep", "120"],
                 volumes={volume_name: {"bind": "/volume", "mode": "rw"}},
             )
             try:
-                with open(archive_path, "rb") as fh:
+                with open(normalized_archive_path, "rb") as fh:
                     helper_container.put_archive("/volume", fh.read())
             finally:
                 helper_container.remove(force=True)
