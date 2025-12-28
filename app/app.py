@@ -410,6 +410,20 @@ def import_container_backup(file_path, client=None):
     return new_images[0]
 
 
+def remove_existing_container(container_name, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    try:
+        container = client.containers.get(container_name)
+    except docker.errors.NotFound:
+        return False
+    if container.status == "running":
+        container.stop(timeout=10)
+    container.remove()
+    return True
+
+
 def scheduled_container_backup(container_name, retention):
     client = ensure_docker_client()
     if not client:
@@ -663,11 +677,14 @@ def backup_image_route(image_id):
 def restore_backup():
     backup_id = request.form.get("backup_id")
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT target_type, file_path FROM backups WHERE id = ?", (backup_id,)).fetchone()
+        row = conn.execute(
+            "SELECT target_type, target_name, file_path FROM backups WHERE id = ?",
+            (backup_id,),
+        ).fetchone()
     if not row:
         flash("Sauvegarde introuvable.", "error")
         return redirect(url_for("dashboard"))
-    target_type, file_path = row
+    target_type, target_name, file_path = row
     client = ensure_docker_client()
     if not client:
         flash(docker_unavailable_message(), "error")
@@ -679,11 +696,17 @@ def restore_backup():
         else:
             image = import_container_backup(file_path, client=client)
             image_config = image.attrs.get("Config") or {}
+            removed_existing = False
+            if target_name:
+                removed_existing = remove_existing_container(target_name, client=client)
             if image_config.get("Cmd") or image_config.get("Entrypoint"):
-                client.containers.run(image.id, detach=True)
+                client.containers.run(image.id, detach=True, name=target_name or None)
                 flash("Restauration déclenchée.", "success")
             else:
-                flash("Image importée. Aucun CMD/Entrypoint détecté, créez le conteneur manuellement.", "success")
+                message = "Image importée. Aucun CMD/Entrypoint détecté, créez le conteneur manuellement."
+                if removed_existing:
+                    message = "Conteneur existant supprimé. " + message
+                flash(message, "success")
         if target_type == "image":
             flash("Restauration déclenchée.", "success")
     except docker.errors.DockerException as exc:
