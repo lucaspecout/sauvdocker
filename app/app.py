@@ -540,6 +540,77 @@ def backup_stack(stack_name, client=None):
         return False
 
 
+def get_container_env(container):
+    return container.attrs.get("Config", {}).get("Env", []) or []
+
+
+def is_database_container(container):
+    hints = (
+        "postgres",
+        "postgis",
+        "mysql",
+        "mariadb",
+        "percona",
+        "mssql",
+        "mongo",
+        "redis",
+    )
+    env_hints = (
+        "POSTGRES_DB",
+        "POSTGRES_USER",
+        "PGDATA",
+        "MYSQL_DATABASE",
+        "MYSQL_USER",
+        "MARIADB_DATABASE",
+        "MARIADB_USER",
+        "MONGO_INITDB_DATABASE",
+        "REDIS_PASSWORD",
+    )
+    container_name = (container.name or "").lower()
+    if any(hint in container_name for hint in hints):
+        return True
+    image_tags = container.image.tags or []
+    if any(hint in tag.lower() for hint in hints for tag in image_tags):
+        return True
+    env_values = get_container_env(container)
+    if any(env_key in env_item for env_key in env_hints for env_item in env_values):
+        return True
+    return False
+
+
+def backup_stack_with_db_pause(stack_name, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    stack_containers = []
+    for container in client.containers.list(all=True):
+        container_stack, label_key = get_container_stack(container)
+        if container_stack == stack_name:
+            stack_containers.append(container)
+    if not stack_containers:
+        raise RuntimeError("Aucun conteneur trouvé pour cette stack.")
+    db_containers = [container for container in stack_containers if is_database_container(container)]
+    stopped_containers = []
+    try:
+        for container in db_containers:
+            container.reload()
+            if container.status == "running":
+                log_docker_event(f"stack_backup_stop_db container={container.name} stack={stack_name}")
+                container.stop(timeout=10)
+                stopped_containers.append(container)
+        return backup_stack(stack_name, client=client)
+    finally:
+        for container in stopped_containers:
+            try:
+                log_docker_event(f"stack_backup_start_db container={container.name} stack={stack_name}")
+                container.start()
+            except docker.errors.DockerException as exc:
+                log_docker_event(
+                    f"stack_backup_restart_db_error container={container.name} stack={stack_name} error={exc}",
+                    logging.WARNING,
+                )
+
+
 def backup_image(image_id, name=None, client=None):
     client = client or ensure_docker_client()
     if not client:
@@ -1299,6 +1370,26 @@ def backup_stack_route(stack_name):
         flash("Sauvegarde de la stack créée.", "success")
     else:
         flash("Échec de la sauvegarde de la stack.", "error")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/backup/stack/<stack_name>/db-safe", methods=["POST"])
+@login_required
+def backup_stack_db_safe_route(stack_name):
+    client = ensure_docker_client()
+    if not client:
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+    try:
+        success = backup_stack_with_db_pause(stack_name, client=client)
+    except docker.errors.DockerException as exc:
+        reset_docker_client(str(exc))
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+    if success:
+        flash("Sauvegarde stack avec arrêt DB créée.", "success")
+    else:
+        flash("Échec de la sauvegarde stack avec arrêt DB.", "error")
     return redirect(url_for("dashboard"))
 
 

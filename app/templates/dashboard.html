@@ -43,6 +43,9 @@
             <form method="post" action="{{ url_for('backup_stack_route', stack_name=stack_name) }}">
               <button type="submit">Sauvegarder la stack</button>
             </form>
+            <form method="post" action="{{ url_for('backup_stack_db_safe_route', stack_name=stack_name) }}">
+              <button type="submit" class="ghost">Sauvegarde stack (arrêt DB)</button>
+            </form>
             <details class="history-details">
               <summary>Historique</summary>
               {% set history = stack_backups.get(stack_name, []) %}
