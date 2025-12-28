@@ -17,7 +17,76 @@
 
 <section class="grid">
   <div class="panel">
-    <h3>Conteneurs détectés</h3>
+    <h3>Stacks détectées</h3>
+    <div class="card-list">
+      {% for stack_name, stack_containers in stacks.items() %}
+        <div class="card">
+          <div>
+            <h4>{{ stack_name }}</h4>
+            <p>{{ stack_containers | length }} conteneur(s)</p>
+            <ul>
+              {% for container in stack_containers %}
+                <li>{{ container.name }}</li>
+              {% endfor %}
+            </ul>
+            {% set last_backup = latest_stack_backups.get(stack_name) %}
+            {% if last_backup %}
+              <p class="backup-summary">
+                Dernière sauvegarde : {{ last_backup[4] }}
+                <span class="status {{ last_backup[5] }}">{{ last_backup[5] }}</span>
+              </p>
+            {% else %}
+              <p class="backup-summary">Dernière sauvegarde : aucune</p>
+            {% endif %}
+          </div>
+          <div class="card-actions">
+            <form method="post" action="{{ url_for('backup_stack_route', stack_name=stack_name) }}">
+              <button type="submit">Sauvegarder la stack</button>
+            </form>
+            <details class="history-details">
+              <summary>Historique</summary>
+              {% set history = stack_backups.get(stack_name, []) %}
+              <div class="table compact">
+                <div class="table-row header">
+                  <span>Type</span>
+                  <span>Nom</span>
+                  <span>Date</span>
+                  <span>Statut</span>
+                  <span>Actions</span>
+                </div>
+                {% for backup in history %}
+                  <div class="table-row">
+                    <span>{{ backup[1] }}</span>
+                    <span>{{ backup[2] }}</span>
+                    <span>{{ backup[4] }}</span>
+                    <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+                    <span class="actions">
+                      <a href="{{ url_for('download_backup', filename=backup[3].split('/')[-1]) }}">Télécharger</a>
+                      <form method="post" action="{{ url_for('restore_backup') }}">
+                        <input type="hidden" name="backup_id" value="{{ backup[0] }}">
+                        <button type="submit">Restaurer</button>
+                      </form>
+                      <form method="post" action="{{ url_for('delete_backup') }}">
+                        <input type="hidden" name="backup_id" value="{{ backup[0] }}">
+                        <button type="submit" class="danger">Supprimer</button>
+                      </form>
+                    </span>
+                  </div>
+                {% else %}
+                  <p>Aucune sauvegarde encore.</p>
+                {% endfor %}
+              </div>
+            </details>
+          </div>
+        </div>
+      {% else %}
+        <p>Aucune stack détectée.</p>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Conteneurs indépendants</h3>
     <div class="card-list">
       {% for container in containers %}
         <div class="card">
@@ -112,7 +181,7 @@
           </div>
         </div>
       {% else %}
-        <p>Aucun conteneur détecté.</p>
+        <p>Aucun conteneur indépendant détecté.</p>
       {% endfor %}
     </div>
   </div>
