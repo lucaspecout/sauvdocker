@@ -31,8 +31,17 @@ login_manager.init_app(app)
 def get_docker_client():
     docker_host = os.environ.get("DOCKER_HOST", "")
     if docker_host.startswith("http+docker://"):
-        os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
-    return docker.from_env()
+        docker_host = "unix:///var/run/docker.sock"
+        os.environ["DOCKER_HOST"] = docker_host
+        return docker.DockerClient(base_url=docker_host)
+    try:
+        return docker.from_env()
+    except docker.errors.DockerException:
+        if docker_host:
+            raise
+        if Path("/var/run/docker.sock").exists():
+            return docker.DockerClient(base_url="unix:///var/run/docker.sock")
+        raise
 
 
 docker_client = get_docker_client()
