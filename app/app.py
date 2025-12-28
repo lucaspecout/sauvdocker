@@ -33,6 +33,7 @@ LOG_FILE = LOG_DIR / "sauvedocker.log"
 
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "Admin123!"
+STACK_LABEL_KEYS = ("com.docker.stack.namespace", "com.docker.compose.project")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("APP_SECRET", "change-this-secret")
@@ -427,6 +428,118 @@ def backup_container(container_id, name=None, client=None, retention=None):
         return False
 
 
+def backup_stack(stack_name, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    containers = []
+    for container in client.containers.list(all=True):
+        container_stack, label_key = get_container_stack(container)
+        if container_stack == stack_name:
+            containers.append(container)
+    if not containers:
+        raise RuntimeError("Aucun conteneur trouvé pour cette stack.")
+    filename = f"stack-{stack_name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar"
+    file_path = BACKUP_DIR / filename
+    try:
+        temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-stack-"))
+        try:
+            images_dir = temp_dir / "images"
+            images_dir.mkdir(parents=True, exist_ok=True)
+            volumes_dir = temp_dir / "volumes"
+            volumes_dir.mkdir(parents=True, exist_ok=True)
+            image_entries = {}
+            container_entries = []
+            for container in containers:
+                image = container.image
+                image_id = image.id
+                if image_id not in image_entries:
+                    image_filename = f"{image_id.replace(':', '_')}.tar"
+                    image_tar_path = images_dir / image_filename
+                    with open(image_tar_path, "wb") as fh:
+                        for chunk in image.save(named=True):
+                            fh.write(chunk)
+                    image_entries[image_id] = {
+                        "id": image_id,
+                        "tags": image.tags or [],
+                        "file": f"images/{image_filename}",
+                    }
+                volume_mappings = []
+                for mount in container.attrs.get("Mounts", []):
+                    if mount.get("Type") != "volume":
+                        continue
+                    volume_name = mount.get("Name")
+                    destination = mount.get("Destination")
+                    if not volume_name or not destination:
+                        continue
+                    volume_mappings.append(
+                        {
+                            "name": volume_name,
+                            "destination": destination,
+                            "read_only": not mount.get("RW", True),
+                        }
+                    )
+                container_entries.append(
+                    {
+                        "name": container.name,
+                        "config": container.attrs.get("Config", {}),
+                        "host_config": container.attrs.get("HostConfig", {}),
+                        "image_id": image_id,
+                        "image_tags": image.tags or [],
+                        "volumes": volume_mappings,
+                        "networks": collect_container_networks(container, client),
+                    }
+                )
+            volume_entries = []
+            stack_volumes = collect_stack_volumes(client, stack_name)
+            helper_image = None
+            if stack_volumes:
+                helper_image = ensure_helper_image(client)
+            for volume in stack_volumes:
+                volume_name = volume.name
+                if not volume_name:
+                    continue
+                volume_tar_path = volumes_dir / f"{volume_name}.tar"
+                backup_volume_archive(volume_name, volume_tar_path, client, helper_image)
+                volume_attrs = volume.attrs or {}
+                volume_entries.append(
+                    {
+                        "name": volume_name,
+                        "driver": volume_attrs.get("Driver"),
+                        "labels": volume_attrs.get("Labels") or {},
+                        "options": volume_attrs.get("Options") or {},
+                    }
+                )
+            manifest = {
+                "version": 1,
+                "stack": {"name": stack_name},
+                "containers": container_entries,
+                "images": list(image_entries.values()),
+                "volumes": volume_entries,
+                "networks": collect_stack_networks(client, stack_name),
+            }
+            manifest_path = temp_dir / "manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, ensure_ascii=False, indent=2)
+            with tarfile.open(file_path, "w") as tar:
+                tar.add(manifest_path, arcname="manifest.json")
+                if image_entries:
+                    tar.add(images_dir, arcname="images")
+                if volume_entries:
+                    tar.add(volumes_dir, arcname="volumes")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        record_backup("stack", stack_name, str(file_path), "success")
+        cleanup_old_backups(get_int_setting("backup_retention", 20), target_type="stack", target_name=stack_name)
+        run_drive_transfer(str(file_path))
+        send_alert("Sauvegarde stack réussie", f"Sauvegarde créée pour {stack_name}")
+        return True
+    except Exception as exc:
+        record_backup("stack", stack_name, str(file_path), "failed", str(exc))
+        send_alert("Sauvegarde stack échouée", f"Erreur pour {stack_name}: {exc}")
+        return False
+
+
 def backup_image(image_id, name=None, client=None):
     client = client or ensure_docker_client()
     if not client:
@@ -523,6 +636,84 @@ def collect_container_networks(container, client):
             }
         )
     return networks
+
+
+def get_container_stack(container):
+    labels = container.labels or {}
+    if not labels:
+        labels = container.attrs.get("Config", {}).get("Labels", {}) or {}
+    for label_key in STACK_LABEL_KEYS:
+        value = labels.get(label_key)
+        if value:
+            return value, label_key
+    return None, None
+
+
+def split_containers_by_stack(containers):
+    stacks = {}
+    standalone = []
+    stack_label_keys = {}
+    for container in containers:
+        stack_name, label_key = get_container_stack(container)
+        if stack_name:
+            stacks.setdefault(stack_name, []).append(container)
+            if label_key:
+                stack_label_keys.setdefault(stack_name, label_key)
+        else:
+            standalone.append(container)
+    return standalone, stacks, stack_label_keys
+
+
+def collect_stack_networks(client, stack_name):
+    networks = []
+    seen = set()
+    for label_key in STACK_LABEL_KEYS:
+        for network in client.networks.list(filters={"label": f"{label_key}={stack_name}"}):
+            if network.name in seen:
+                continue
+            seen.add(network.name)
+            attrs = network.attrs or {}
+            ipam = attrs.get("IPAM") or {}
+            networks.append(
+                {
+                    "name": network.name,
+                    "driver": attrs.get("Driver"),
+                    "options": attrs.get("Options") or {},
+                    "ipam_config": ipam.get("Config") or [],
+                    "labels": attrs.get("Labels") or {},
+                    "internal": attrs.get("Internal", False),
+                    "attachable": attrs.get("Attachable", False),
+                    "enable_ipv6": attrs.get("EnableIPv6", False),
+                }
+            )
+    return networks
+
+
+def collect_stack_volumes(client, stack_name):
+    volumes = []
+    seen = set()
+    for label_key in STACK_LABEL_KEYS:
+        for volume in client.volumes.list(filters={"label": f"{label_key}={stack_name}"}):
+            if volume.name in seen:
+                continue
+            seen.add(volume.name)
+            volumes.append(volume)
+    return volumes
+
+
+def backup_volume_archive(volume_name, archive_path, client, helper_image):
+    helper_container = client.containers.create(
+        helper_image.id,
+        command=["sleep", "120"],
+        volumes={volume_name: {"bind": "/volume", "mode": "ro"}},
+    )
+    try:
+        archive_stream, _ = helper_container.get_archive("/volume/.")
+        with open(archive_path, "wb") as fh:
+            for chunk in archive_stream:
+                fh.write(chunk)
+    finally:
+        helper_container.remove(force=True)
 
 
 def build_ipam_config(config_entries):
@@ -724,6 +915,121 @@ def restore_container_bundle(file_path, client=None):
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def restore_stack_bundle(file_path, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-stack-restore-"))
+    try:
+        with tarfile.open(file_path, "r") as tar:
+            tar.extract("manifest.json", path=temp_dir)
+            image_members = [member for member in tar.getmembers() if member.name.startswith("images/")]
+            volume_members = [member for member in tar.getmembers() if member.name.startswith("volumes/")]
+            if image_members:
+                tar.extractall(path=temp_dir, members=image_members)
+            if volume_members:
+                tar.extractall(path=temp_dir, members=volume_members)
+        with open(temp_dir / "manifest.json", "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        for image_entry in manifest.get("images", []):
+            image_tags = image_entry.get("tags") or []
+            if image_tags:
+                remove_images_by_tags(client, image_tags)
+            image_path = temp_dir / image_entry.get("file", "")
+            if not image_path.exists():
+                continue
+            with open(image_path, "rb") as fh:
+                client.images.load(fh.read())
+        volume_entries = manifest.get("volumes", [])
+        network_entries = manifest.get("networks", [])
+        helper_image = None
+        if volume_entries:
+            helper_image = ensure_helper_image(client)
+        for volume in volume_entries:
+            volume_name = volume.get("name")
+            if not volume_name:
+                continue
+            try:
+                client.volumes.get(volume_name)
+                reset_volume_contents(client, helper_image, volume_name)
+            except docker.errors.NotFound:
+                client.volumes.create(
+                    name=volume_name,
+                    driver=volume.get("driver"),
+                    driver_opts=volume.get("options") or None,
+                    labels=volume.get("labels") or None,
+                )
+            archive_path = temp_dir / "volumes" / f"{volume_name}.tar"
+            if not archive_path.exists():
+                continue
+            helper_container = client.containers.create(
+                helper_image.id,
+                command=["sleep", "120"],
+                volumes={volume_name: {"bind": "/volume", "mode": "rw"}},
+            )
+            try:
+                with open(archive_path, "rb") as fh:
+                    helper_container.put_archive("/volume", fh.read())
+            finally:
+                helper_container.remove(force=True)
+        for network_entry in network_entries:
+            ensure_network(client, network_entry)
+        for container_entry in manifest.get("containers", []):
+            container_name = container_entry.get("name")
+            config = container_entry.get("config", {})
+            host_config = container_entry.get("host_config", {})
+            image_tags = container_entry.get("image_tags") or []
+            image_ref = image_tags[0] if image_tags else container_entry.get("image_id")
+            if not image_ref:
+                raise RuntimeError("Image introuvable pour restaurer la stack.")
+            if container_name:
+                remove_existing_container(container_name, client=client)
+            volumes = {}
+            for volume in container_entry.get("volumes", []):
+                volume_name = volume.get("name")
+                destination = volume.get("destination")
+                if not volume_name or not destination:
+                    continue
+                mode = "ro" if volume.get("read_only") else "rw"
+                volumes[volume_name] = {"bind": destination, "mode": mode}
+            ports = normalize_port_bindings(host_config.get("PortBindings"))
+            network_mode = host_config.get("NetworkMode")
+            restart_policy = host_config.get("RestartPolicy") or None
+            container = client.containers.create(
+                image_ref,
+                name=container_name or None,
+                command=config.get("Cmd"),
+                entrypoint=config.get("Entrypoint"),
+                environment=config.get("Env"),
+                working_dir=config.get("WorkingDir") or None,
+                labels=config.get("Labels") or None,
+                ports=ports,
+                volumes=volumes or None,
+                restart_policy=restart_policy,
+                network_mode=network_mode if network_mode and network_mode != "default" else None,
+            )
+            container.start()
+            for network_entry in container_entry.get("networks", []):
+                network_name = network_entry.get("name")
+                if not network_name or network_name in ("bridge", "host", "none"):
+                    continue
+                if network_mode and network_mode == network_name:
+                    continue
+                try:
+                    network = client.networks.get(network_name)
+                except docker.errors.NotFound:
+                    continue
+                network.connect(
+                    container,
+                    aliases=network_entry.get("aliases") or None,
+                    ipv4_address=network_entry.get("ipv4_address") or None,
+                    ipv6_address=network_entry.get("ipv6_address") or None,
+                )
+        return True
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def remove_existing_container(container_name, client=None):
     client = client or ensure_docker_client()
     if not client:
@@ -823,6 +1129,7 @@ def dashboard():
     else:
         containers = []
         flash(docker_unavailable_message(), "error")
+    containers, stacks, _ = split_containers_by_stack(containers)
     schedules = get_container_schedules()
     week_days = [
         {"value": "mon", "label": "Lun"},
@@ -838,19 +1145,28 @@ def dashboard():
             "SELECT id, target_type, target_name, file_path, created_at, status, error_message FROM backups ORDER BY created_at DESC"
         ).fetchall()
     container_backups = {}
+    stack_backups = {}
     for backup in backups:
         if backup[1] != "container":
+            if backup[1] == "stack":
+                stack_backups.setdefault(backup[2], []).append(backup)
             continue
         container_backups.setdefault(backup[2], []).append(backup)
     latest_container_backups = {
         name: history[0] for name, history in container_backups.items() if history
     }
+    latest_stack_backups = {
+        name: history[0] for name, history in stack_backups.items() if history
+    }
     return render_template(
         "dashboard.html",
         containers=containers,
+        stacks=stacks,
         backups=backups,
         container_backups=container_backups,
         latest_container_backups=latest_container_backups,
+        stack_backups=stack_backups,
+        latest_stack_backups=latest_stack_backups,
         schedules=schedules,
         week_days=week_days,
         force_password_change=current_user.force_password_change,
@@ -966,6 +1282,26 @@ def backup_container_route(container_id):
     return redirect(url_for("dashboard"))
 
 
+@app.route("/backup/stack/<stack_name>", methods=["POST"])
+@login_required
+def backup_stack_route(stack_name):
+    client = ensure_docker_client()
+    if not client:
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+    try:
+        success = backup_stack(stack_name, client=client)
+    except docker.errors.DockerException as exc:
+        reset_docker_client(str(exc))
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+    if success:
+        flash("Sauvegarde de la stack créée.", "success")
+    else:
+        flash("Échec de la sauvegarde de la stack.", "error")
+    return redirect(url_for("dashboard"))
+
+
 @app.route("/backup/image/<image_id>", methods=["POST"])
 @login_required
 def backup_image_route(image_id):
@@ -1009,6 +1345,10 @@ def restore_backup():
         if target_type == "image":
             with open(file_path, "rb") as fh:
                 client.images.load(fh.read())
+        elif target_type == "stack":
+            restore_stack_bundle(file_path, client=client)
+            flash("Restauration de la stack déclenchée.", "success")
+            return redirect(url_for("dashboard"))
         else:
             if tarfile.is_tarfile(file_path):
                 with tarfile.open(file_path, "r") as tar:
