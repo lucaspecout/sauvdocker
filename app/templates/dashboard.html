@@ -4,7 +4,7 @@
 <section class="hero">
   <div>
     <h2>Tableau de bord des sauvegardes</h2>
-    <p>Automatisation, alertes et restauration directe des conteneurs et images.</p>
+    <p>Automatisation, alertes et restauration directe des conteneurs.</p>
   </div>
   <div class="hero-badge">
     <span>🔒 Sécurité maximale activée</span>
@@ -74,40 +74,7 @@
     </div>
   </div>
 
-  <div class="panel">
-    <h3>Images détectées</h3>
-    <div class="card-list">
-      {% for image in images %}
-        <div class="card">
-          <div>
-            <h4>{{ image.tags[0] if image.tags else image.short_id }}</h4>
-            <p>ID: {{ image.short_id }}</p>
-          </div>
-          <form method="post" action="{{ url_for('backup_image_route', image_id=image.id) }}">
-            <button type="submit">Sauvegarder</button>
-          </form>
-        </div>
-      {% else %}
-        <p>Aucune image détectée.</p>
-      {% endfor %}
-    </div>
-  </div>
-
-  <div class="panel">
-    <h3>Volumes détectés</h3>
-    <div class="card-list">
-      {% for volume in volumes %}
-        <div class="card">
-          <div>
-            <h4>{{ volume.name }}</h4>
-            <p>Driver: {{ volume.attrs.get("Driver", "local") }}</p>
-          </div>
-        </div>
-      {% else %}
-        <p>Aucun volume détecté.</p>
-      {% endfor %}
-    </div>
-  </div>
+  
 </section>
 
 <section class="panel">
