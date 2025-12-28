@@ -1080,7 +1080,10 @@ def restore_stack_bundle(file_path, client=None):
                 network_mode=network_mode if network_mode and network_mode != "default" else None,
             )
             container.start()
-            for network_entry in container_entry.get("networks", []):
+            container_networks = container_entry.get("networks") or []
+            if not container_networks and network_entries:
+                container_networks = network_entries
+            for network_entry in container_networks:
                 network_name = network_entry.get("name")
                 if not network_name or network_name in ("bridge", "host", "none"):
                     continue
