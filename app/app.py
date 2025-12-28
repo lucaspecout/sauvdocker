@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import base64
+import io
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -10,6 +12,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import docker
 from requests.exceptions import InvalidURL
 import pyotp
+import qrcode
 from apscheduler.schedulers.background import BackgroundScheduler
 import smtplib
 from email.mime.text import MIMEText
@@ -359,15 +362,22 @@ def setup_mfa():
     mfa_secret = session.get("mfa_secret") or current_user.mfa_secret
     totp = pyotp.TOTP(mfa_secret)
     provisioning_uri = totp.provisioning_uri(name=current_user.username, issuer_name="SauveDocker")
+    qr = qrcode.QRCode(box_size=6, border=2)
+    qr.add_data(provisioning_uri)
+    qr.make(fit=True)
+    qr_image = qr.make_image(fill_color="black", back_color="white")
+    qr_buffer = io.BytesIO()
+    qr_image.save(qr_buffer, format="PNG")
+    qr_code = base64.b64encode(qr_buffer.getvalue()).decode("utf-8")
     if request.method == "POST":
         otp = request.form.get("otp")
         if not totp.verify(otp):
             flash("Code MFA invalide", "error")
-            return render_template("setup_mfa.html", secret=mfa_secret, uri=provisioning_uri)
+            return render_template("setup_mfa.html", secret=mfa_secret, uri=provisioning_uri, qr_code=qr_code)
         session.pop("mfa_secret", None)
         flash("MFA configuré avec succès.", "success")
         return redirect(url_for("dashboard"))
-    return render_template("setup_mfa.html", secret=mfa_secret, uri=provisioning_uri)
+    return render_template("setup_mfa.html", secret=mfa_secret, uri=provisioning_uri, qr_code=qr_code)
 
 
 @app.route("/logout")

@@ -3,8 +3,11 @@
 {% block content %}
 <section class="panel">
   <h2>Configurer la MFA</h2>
-  <p>Ajoutez SauveDocker à votre application d'authentification avec le secret ci-dessous.</p>
+  <p>Scannez le QR code dans votre application d'authentification pour activer la MFA.</p>
   <div class="mfa-box">
+    <div class="mfa-qr">
+      <img src="data:image/png;base64,{{ qr_code }}" alt="QR code MFA SauveDocker">
+    </div>
     <div>
       <p><strong>Secret :</strong></p>
       <code>{{ secret }}</code>
