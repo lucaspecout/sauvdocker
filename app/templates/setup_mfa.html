@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <h2>Configurer la MFA</h2>
+  <p>Ajoutez SauveDocker à votre application d'authentification avec le secret ci-dessous.</p>
+  <div class="mfa-box">
+    <div>
+      <p><strong>Secret :</strong></p>
+      <code>{{ secret }}</code>
+    </div>
+    <div>
+      <p><strong>URI :</strong></p>
+      <code>{{ uri }}</code>
+    </div>
+  </div>
+  <form method="post" class="form-grid">
+    <label>
+      Code de validation
+      <input type="text" name="otp" required>
+    </label>
+    <button type="submit" class="primary">Valider MFA</button>
+  </form>
+</section>
+{% endblock %}

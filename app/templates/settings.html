@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <h2>Paramètres d'automatisation</h2>
+  <form method="post" class="form-grid">
+    <label>
+      Intervalle de sauvegarde (minutes)
+      <input type="number" name="backup_interval" value="{{ backup_interval }}" min="5" required>
+    </label>
+    <button type="submit" class="primary">Mettre à jour</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Alertes email</h2>
+  <form method="post" class="form-grid">
+    <label>
+      SMTP Host
+      <input type="text" name="smtp_host" value="{{ smtp_host }}">
+    </label>
+    <label>
+      SMTP Port
+      <input type="number" name="smtp_port" value="{{ smtp_port }}">
+    </label>
+    <label>
+      SMTP User
+      <input type="text" name="smtp_user" value="{{ smtp_user }}">
+    </label>
+    <label>
+      SMTP Password
+      <input type="password" name="smtp_password" value="{{ smtp_password }}">
+    </label>
+    <label>
+      Email d'alerte
+      <input type="email" name="alert_email" value="{{ alert_email }}">
+    </label>
+    <button type="submit" class="primary">Enregistrer</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Transfert vers Drive</h2>
+  <form method="post" class="form-grid">
+    <label>
+      Commande de transfert
+      <input type="text" name="drive_command" value="{{ drive_command }}" placeholder="rclone">
+    </label>
+    <label>
+      Cible Drive (rclone remote)
+      <input type="text" name="drive_target" value="{{ drive_target }}" placeholder="drive:Sauvegardes">
+    </label>
+    <button type="submit" class="primary">Activer</button>
+  </form>
+</section>
+{% endblock %}
