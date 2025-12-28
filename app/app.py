@@ -37,9 +37,9 @@ def normalize_docker_host(docker_host):
         return ""
     normalized = docker_host.strip()
     if normalized.lower().startswith("http+docker://"):
-        normalized = "unix://var/run/docker.sock"
-    if normalized.lower().startswith("unix:///"):
-        normalized = f"unix://{normalized[8:]}"
+        normalized = "unix:///var/run/docker.sock"
+    if normalized.lower().startswith("unix://") and not normalized.lower().startswith("unix:///"):
+        normalized = f"unix:///{normalized[7:]}"
     return normalized
 
 
@@ -69,7 +69,9 @@ def get_docker_client():
         pass
 
     if Path("/var/run/docker.sock").exists():
-        client = build_docker_client("unix://var/run/docker.sock")
+        fallback_host = "unix:///var/run/docker.sock"
+        os.environ["DOCKER_HOST"] = fallback_host
+        client = build_docker_client(fallback_host)
         if client:
             return client
     details = f" Détails: {', '.join(errors)}." if errors else ""
