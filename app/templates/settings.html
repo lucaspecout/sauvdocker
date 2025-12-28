@@ -8,6 +8,10 @@
       Intervalle de sauvegarde (minutes)
       <input type="number" name="backup_interval" value="{{ backup_interval }}" min="5" required>
     </label>
+    <label>
+      Nombre maximum de sauvegardes conservées
+      <input type="number" name="backup_retention" value="{{ backup_retention }}" min="0" required>
+    </label>
     <button type="submit" class="primary">Mettre à jour</button>
   </form>
 </section>
