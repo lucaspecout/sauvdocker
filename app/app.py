@@ -5,6 +5,10 @@ import io
 from datetime import datetime
 from pathlib import Path
 import subprocess
+import json
+import tarfile
+import tempfile
+import shutil
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -358,9 +362,56 @@ def backup_container(container_id, name=None, client=None, retention=None):
     filename = f"container-{name or container.name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar"
     file_path = BACKUP_DIR / filename
     try:
-        with open(file_path, "wb") as fh:
-            for chunk in container.export():
-                fh.write(chunk)
+        temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-backup-"))
+        try:
+            image = container.image
+            image_tar_path = temp_dir / "image.tar"
+            with open(image_tar_path, "wb") as fh:
+                for chunk in image.save(named=True):
+                    fh.write(chunk)
+            volumes_dir = temp_dir / "volumes"
+            volumes_dir.mkdir(parents=True, exist_ok=True)
+            volume_entries = []
+            for mount in container.attrs.get("Mounts", []):
+                if mount.get("Type") != "volume":
+                    continue
+                volume_name = mount.get("Name")
+                destination = mount.get("Destination")
+                if not volume_name or not destination:
+                    continue
+                volume_tar_path = volumes_dir / f"{volume_name}.tar"
+                archive_stream, _ = container.get_archive(destination)
+                with open(volume_tar_path, "wb") as fh:
+                    for chunk in archive_stream:
+                        fh.write(chunk)
+                volume_entries.append(
+                    {
+                        "name": volume_name,
+                        "destination": destination,
+                        "read_only": not mount.get("RW", True),
+                    }
+                )
+            manifest = {
+                "version": 1,
+                "container": {
+                    "name": container.name,
+                    "config": container.attrs.get("Config", {}),
+                    "host_config": container.attrs.get("HostConfig", {}),
+                    "image_id": image.id,
+                    "image_tags": image.tags or [],
+                },
+                "volumes": volume_entries,
+            }
+            manifest_path = temp_dir / "manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, ensure_ascii=False, indent=2)
+            with tarfile.open(file_path, "w") as tar:
+                tar.add(manifest_path, arcname="manifest.json")
+                tar.add(image_tar_path, arcname="image.tar")
+                if volume_entries:
+                    tar.add(volumes_dir, arcname="volumes")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         record_backup("container", name or container.name, str(file_path), "success")
         retention_value = retention if retention is not None else get_int_setting("backup_retention", 20)
         cleanup_old_backups(retention_value, target_type="container", target_name=name or container.name)
@@ -408,6 +459,122 @@ def import_container_backup(file_path, client=None):
     if not new_images:
         raise RuntimeError("Import de l'image échoué.")
     return new_images[0]
+
+
+def normalize_port_bindings(port_bindings):
+    if not port_bindings:
+        return None
+    ports = {}
+    for container_port, bindings in port_bindings.items():
+        if not bindings:
+            ports[container_port] = None
+            continue
+        binding = bindings[0] or {}
+        host_port = binding.get("HostPort")
+        host_ip = binding.get("HostIp")
+        if host_port:
+            try:
+                host_port_value = int(host_port)
+            except ValueError:
+                host_port_value = host_port
+        else:
+            host_port_value = None
+        if host_ip and host_ip != "0.0.0.0":
+            ports[container_port] = (host_ip, host_port_value)
+        else:
+            ports[container_port] = host_port_value
+    return ports
+
+
+def ensure_helper_image(client):
+    helper_image = "alpine:3.19"
+    try:
+        return client.images.get(helper_image)
+    except docker.errors.ImageNotFound:
+        return client.images.pull(helper_image)
+
+
+def restore_container_bundle(file_path, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-restore-"))
+    try:
+        with tarfile.open(file_path, "r") as tar:
+            tar.extract("manifest.json", path=temp_dir)
+            tar.extract("image.tar", path=temp_dir)
+            volume_members = [member for member in tar.getmembers() if member.name.startswith("volumes/")]
+            if volume_members:
+                tar.extractall(path=temp_dir, members=volume_members)
+        with open(temp_dir / "manifest.json", "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        with open(temp_dir / "image.tar", "rb") as fh:
+            client.images.load(fh.read())
+        volume_entries = manifest.get("volumes", [])
+        helper_image = None
+        if volume_entries:
+            helper_image = ensure_helper_image(client)
+        for volume in volume_entries:
+            volume_name = volume.get("name")
+            destination = volume.get("destination")
+            if not volume_name or not destination:
+                continue
+            try:
+                client.volumes.get(volume_name)
+            except docker.errors.NotFound:
+                client.volumes.create(name=volume_name)
+            archive_path = temp_dir / "volumes" / f"{volume_name}.tar"
+            if not archive_path.exists():
+                continue
+            helper_container = client.containers.create(
+                helper_image.id,
+                command=["sleep", "120"],
+                volumes={volume_name: {"bind": "/volume", "mode": "rw"}},
+            )
+            try:
+                with open(archive_path, "rb") as fh:
+                    helper_container.put_archive("/volume", fh.read())
+            finally:
+                helper_container.remove(force=True)
+        container_info = manifest.get("container", {})
+        container_name = container_info.get("name")
+        config = container_info.get("config", {})
+        host_config = container_info.get("host_config", {})
+        image_tags = container_info.get("image_tags") or []
+        image_ref = image_tags[0] if image_tags else container_info.get("image_id")
+        if not image_ref:
+            raise RuntimeError("Image introuvable dans la sauvegarde.")
+        removed_existing = False
+        if container_name:
+            removed_existing = remove_existing_container(container_name, client=client)
+        volumes = {}
+        for volume in volume_entries:
+            volume_name = volume.get("name")
+            destination = volume.get("destination")
+            if not volume_name or not destination:
+                continue
+            mode = "ro" if volume.get("read_only") else "rw"
+            volumes[volume_name] = {"bind": destination, "mode": mode}
+        ports = normalize_port_bindings(host_config.get("PortBindings"))
+        network_mode = host_config.get("NetworkMode")
+        restart_policy = host_config.get("RestartPolicy") or None
+        container = client.containers.create(
+            image_ref,
+            name=container_name or None,
+            command=config.get("Cmd"),
+            entrypoint=config.get("Entrypoint"),
+            environment=config.get("Env"),
+            working_dir=config.get("WorkingDir") or None,
+            labels=config.get("Labels") or None,
+            ports=ports,
+            volumes=volumes or None,
+            restart_policy=restart_policy,
+            network_mode=network_mode if network_mode and network_mode != "default" else None,
+        )
+        container.start()
+        return removed_existing
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def remove_existing_container(container_name, client=None):
@@ -502,18 +669,12 @@ def dashboard():
     if client:
         try:
             containers = client.containers.list(all=True)
-            images = client.images.list()
-            volumes = client.volumes.list()
         except docker.errors.DockerException as exc:
             reset_docker_client(str(exc))
             containers = []
-            images = []
-            volumes = []
             flash(docker_unavailable_message(), "error")
     else:
         containers = []
-        images = []
-        volumes = []
         flash(docker_unavailable_message(), "error")
     schedules = get_container_schedules()
     week_days = [
@@ -532,8 +693,6 @@ def dashboard():
     return render_template(
         "dashboard.html",
         containers=containers,
-        images=images,
-        volumes=volumes,
         backups=backups,
         schedules=schedules,
         week_days=week_days,
@@ -694,6 +853,15 @@ def restore_backup():
             with open(file_path, "rb") as fh:
                 client.images.load(fh.read())
         else:
+            if tarfile.is_tarfile(file_path):
+                with tarfile.open(file_path, "r") as tar:
+                    if "manifest.json" in tar.getnames():
+                        removed_existing = restore_container_bundle(file_path, client=client)
+                        if removed_existing:
+                            flash("Conteneur existant supprimé. Restauration déclenchée.", "success")
+                        else:
+                            flash("Restauration déclenchée.", "success")
+                        return redirect(url_for("dashboard"))
             image = import_container_backup(file_path, client=client)
             image_config = image.attrs.get("Config") or {}
             removed_existing = False
