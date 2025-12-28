@@ -208,6 +208,11 @@ button.primary {
   color: var(--text);
 }
 
+button.danger {
+  background: var(--danger);
+  color: var(--text);
+}
+
 input {
   width: 100%;
   margin-top: 8px;
@@ -251,6 +256,10 @@ label {
   font-size: 12px;
 }
 
+.table.compact {
+  margin-top: 12px;
+}
+
 .status.success {
   color: var(--success);
 }
@@ -263,6 +272,22 @@ label {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.backup-summary {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.history-details summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.history-details[open] summary {
+  margin-bottom: 8px;
 }
 
 .flash-group {
