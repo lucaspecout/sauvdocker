@@ -137,6 +137,48 @@ main {
   gap: 16px;
 }
 
+.card-actions {
+  display: grid;
+  gap: 12px;
+  min-width: 240px;
+}
+
+.schedule-summary {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.schedule-form {
+  display: grid;
+  gap: 10px;
+}
+
+.weekday-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.checkbox input {
+  width: auto;
+  margin: 0;
+}
+
+.schedule-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .card h4 {
   margin: 0 0 4px;
 }
@@ -241,6 +283,10 @@ label {
 
 .flash.error {
   border-left: 4px solid var(--danger);
+}
+
+.flash.warning {
+  border-left: 4px solid var(--warning);
 }
 
 .alert.warning {

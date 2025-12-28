@@ -220,6 +220,16 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS container_schedules (
+                container_name TEXT PRIMARY KEY,
+                days TEXT NOT NULL,
+                time TEXT NOT NULL,
+                retention INTEGER NOT NULL
+            )
+            """
+        )
         conn.commit()
 
     ensure_admin_user()
@@ -304,14 +314,24 @@ def record_backup(target_type, target_name, file_path, status, error_message=Non
         conn.commit()
 
 
-def cleanup_old_backups(max_keep):
+def cleanup_old_backups(max_keep, target_type=None, target_name=None):
     if max_keep is None or max_keep <= 0:
         return
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT id, file_path FROM backups ORDER BY created_at DESC LIMIT -1 OFFSET ?",
-            (max_keep,),
-        ).fetchall()
+        query = "SELECT id, file_path FROM backups"
+        params = []
+        conditions = []
+        if target_type:
+            conditions.append("target_type = ?")
+            params.append(target_type)
+        if target_name:
+            conditions.append("target_name = ?")
+            params.append(target_name)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC LIMIT -1 OFFSET ?"
+        params.append(max_keep)
+        rows = conn.execute(query, params).fetchall()
         if not rows:
             return
         backup_ids = [row[0] for row in rows]
@@ -330,7 +350,7 @@ def cleanup_old_backups(max_keep):
             log_docker_event(f"backup_cleanup_error path={file_path} error={exc}", logging.WARNING)
 
 
-def backup_container(container_id, name=None, client=None):
+def backup_container(container_id, name=None, client=None, retention=None):
     client = client or ensure_docker_client()
     if not client:
         raise docker.errors.DockerException(docker_unavailable_message())
@@ -342,7 +362,8 @@ def backup_container(container_id, name=None, client=None):
             for chunk in container.export():
                 fh.write(chunk)
         record_backup("container", name or container.name, str(file_path), "success")
-        cleanup_old_backups(get_int_setting("backup_retention", 20))
+        retention_value = retention if retention is not None else get_int_setting("backup_retention", 20)
+        cleanup_old_backups(retention_value, target_type="container", target_name=name or container.name)
         run_drive_transfer(str(file_path))
         send_alert("Sauvegarde container réussie", f"Sauvegarde créée pour {name or container.name}")
         return True
@@ -365,7 +386,7 @@ def backup_image(image_id, name=None, client=None):
             for chunk in image_data:
                 fh.write(chunk)
         record_backup("image", name or image.short_id, str(file_path), "success")
-        cleanup_old_backups(get_int_setting("backup_retention", 20))
+        cleanup_old_backups(get_int_setting("backup_retention", 20), target_type="image")
         run_drive_transfer(str(file_path))
         send_alert("Sauvegarde image réussie", f"Sauvegarde créée pour {name or image.short_id}")
         return True
@@ -389,23 +410,75 @@ def import_container_backup(file_path, client=None):
     return new_images[0]
 
 
-def scheduled_backup():
+def scheduled_container_backup(container_name, retention):
     client = ensure_docker_client()
     if not client:
         return
-    containers = client.containers.list(all=True)
-    images = client.images.list()
-    for container in containers:
-        backup_container(container.id, container.name, client=client)
-    for image in images:
-        name = image.tags[0] if image.tags else image.short_id
-        backup_image(image.id, name, client=client)
+    try:
+        container = client.containers.get(container_name)
+    except docker.errors.DockerException as exc:
+        log_docker_event(f"scheduled_backup_error container={container_name} error={exc}", logging.WARNING)
+        return
+    backup_container(container.id, container.name, client=client, retention=retention)
+
+
+def get_container_schedules():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT container_name, days, time, retention FROM container_schedules"
+        ).fetchall()
+    schedules = {}
+    for name, days, time_value, retention in rows:
+        schedules[name] = {
+            "days": [day for day in days.split(",") if day],
+            "time": time_value,
+            "retention": retention,
+        }
+    return schedules
+
+
+def set_container_schedule(container_name, days, time_value, retention):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO container_schedules (container_name, days, time, retention)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(container_name) DO UPDATE SET days = excluded.days, time = excluded.time, retention = excluded.retention
+            """,
+            (container_name, ",".join(days), time_value, retention),
+        )
+        conn.commit()
+
+
+def delete_container_schedule(container_name):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM container_schedules WHERE container_name = ?", (container_name,))
+        conn.commit()
 
 
 def refresh_scheduler():
     scheduler.remove_all_jobs()
-    interval_minutes = get_int_setting("backup_interval", 60)
-    scheduler.add_job(scheduled_backup, "interval", minutes=interval_minutes, id="auto_backup")
+    schedules = get_container_schedules()
+    for container_name, schedule in schedules.items():
+        if not schedule["days"] or not schedule["time"]:
+            continue
+        try:
+            hour_str, minute_str = schedule["time"].split(":")
+            scheduler.add_job(
+                scheduled_container_backup,
+                "cron",
+                day_of_week=",".join(schedule["days"]),
+                hour=int(hour_str),
+                minute=int(minute_str),
+                args=[container_name, schedule["retention"]],
+                id=f"container_backup_{container_name}",
+                replace_existing=True,
+            )
+        except ValueError:
+            log_docker_event(
+                f"schedule_invalid_time container={container_name} time={schedule['time']}",
+                logging.WARNING,
+            )
 
 
 @app.route("/")
@@ -428,6 +501,16 @@ def dashboard():
         images = []
         volumes = []
         flash(docker_unavailable_message(), "error")
+    schedules = get_container_schedules()
+    week_days = [
+        {"value": "mon", "label": "Lun"},
+        {"value": "tue", "label": "Mar"},
+        {"value": "wed", "label": "Mer"},
+        {"value": "thu", "label": "Jeu"},
+        {"value": "fri", "label": "Ven"},
+        {"value": "sat", "label": "Sam"},
+        {"value": "sun", "label": "Dim"},
+    ]
     with sqlite3.connect(DB_PATH) as conn:
         backups = conn.execute(
             "SELECT id, target_type, target_name, file_path, created_at, status, error_message FROM backups ORDER BY created_at DESC"
@@ -438,6 +521,8 @@ def dashboard():
         images=images,
         volumes=volumes,
         backups=backups,
+        schedules=schedules,
+        week_days=week_days,
         force_password_change=current_user.force_password_change,
     )
 
@@ -537,7 +622,9 @@ def backup_container_route(container_id):
         return redirect(url_for("dashboard"))
     try:
         container = client.containers.get(container_id)
-        success = backup_container(container.id, container.name, client=client)
+        schedule = get_container_schedules().get(container.name, {})
+        retention = schedule.get("retention")
+        success = backup_container(container.id, container.name, client=client, retention=retention)
     except docker.errors.DockerException as exc:
         reset_docker_client(str(exc))
         flash(docker_unavailable_message(), "error")
@@ -591,13 +678,57 @@ def restore_backup():
                 client.images.load(fh.read())
         else:
             image = import_container_backup(file_path, client=client)
-            client.containers.run(image.id, detach=True)
-        flash("Restauration déclenchée.", "success")
+            image_config = image.attrs.get("Config") or {}
+            if image_config.get("Cmd") or image_config.get("Entrypoint"):
+                client.containers.run(image.id, detach=True)
+                flash("Restauration déclenchée.", "success")
+            else:
+                flash("Image importée. Aucun CMD/Entrypoint détecté, créez le conteneur manuellement.", "success")
+        if target_type == "image":
+            flash("Restauration déclenchée.", "success")
     except docker.errors.DockerException as exc:
         reset_docker_client(str(exc))
         flash(docker_unavailable_message(), "error")
     except Exception as exc:
         flash(f"Erreur de restauration: {exc}", "error")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/schedule/container/<container_id>", methods=["POST"])
+@login_required
+def schedule_container(container_id):
+    client = ensure_docker_client()
+    if not client:
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+    try:
+        container = client.containers.get(container_id)
+    except docker.errors.DockerException as exc:
+        reset_docker_client(str(exc))
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+
+    if request.form.get("disable"):
+        delete_container_schedule(container.name)
+        refresh_scheduler()
+        flash("Planification désactivée.", "success")
+        return redirect(url_for("dashboard"))
+
+    days = request.form.getlist("days")
+    time_value = request.form.get("time", "").strip()
+    retention_raw = request.form.get("retention", "").strip()
+    if not days or not time_value:
+        delete_container_schedule(container.name)
+        refresh_scheduler()
+        flash("Planification désactivée (jour ou heure manquante).", "warning")
+        return redirect(url_for("dashboard"))
+    try:
+        retention = max(0, int(retention_raw or 0))
+    except ValueError:
+        retention = get_int_setting("backup_retention", 20)
+    set_container_schedule(container.name, days, time_value, retention)
+    refresh_scheduler()
+    flash("Planification enregistrée.", "success")
     return redirect(url_for("dashboard"))
 
 
@@ -611,7 +742,6 @@ def download_backup(filename):
 @login_required
 def settings():
     if request.method == "POST":
-        set_setting("backup_interval", request.form.get("backup_interval", "60"))
         set_setting("backup_retention", request.form.get("backup_retention", "20"))
         set_setting("smtp_host", request.form.get("smtp_host"))
         set_setting("smtp_port", request.form.get("smtp_port"))
@@ -624,7 +754,6 @@ def settings():
         flash("Paramètres mis à jour.", "success")
         return redirect(url_for("settings"))
     context = {
-        "backup_interval": get_setting("backup_interval", "60"),
         "backup_retention": get_setting("backup_retention", "20"),
         "smtp_host": get_setting("smtp_host", ""),
         "smtp_port": get_setting("smtp_port", ""),
