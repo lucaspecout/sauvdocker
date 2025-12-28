@@ -17,6 +17,7 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from werkzeug.security import generate_password_hash, check_password_hash
 import docker
 from requests.exceptions import InvalidURL
+from docker import types as docker_types
 import pyotp
 import qrcode
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -392,7 +393,7 @@ def backup_container(container_id, name=None, client=None, retention=None):
                     }
                 )
             manifest = {
-                "version": 1,
+                "version": 2,
                 "container": {
                     "name": container.name,
                     "config": container.attrs.get("Config", {}),
@@ -401,6 +402,7 @@ def backup_container(container_id, name=None, client=None, retention=None):
                     "image_tags": image.tags or [],
                 },
                 "volumes": volume_entries,
+                "networks": collect_container_networks(container, client),
             }
             manifest_path = temp_dir / "manifest.json"
             with open(manifest_path, "w", encoding="utf-8") as fh:
@@ -494,6 +496,98 @@ def ensure_helper_image(client):
         return client.images.pull(helper_image)
 
 
+def collect_container_networks(container, client):
+    networks = []
+    network_settings = container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+    for network_name, details in network_settings.items():
+        try:
+            network = client.networks.get(network_name)
+            network_attrs = network.attrs or {}
+        except docker.errors.NotFound:
+            network_attrs = {}
+        ipam = network_attrs.get("IPAM") or {}
+        networks.append(
+            {
+                "name": network_name,
+                "aliases": details.get("Aliases") or [],
+                "ipv4_address": details.get("IPAddress"),
+                "ipv6_address": details.get("GlobalIPv6Address"),
+                "driver": network_attrs.get("Driver"),
+                "options": network_attrs.get("Options") or {},
+                "ipam_config": ipam.get("Config") or [],
+                "labels": network_attrs.get("Labels") or {},
+                "internal": network_attrs.get("Internal", False),
+                "attachable": network_attrs.get("Attachable", False),
+                "enable_ipv6": network_attrs.get("EnableIPv6", False),
+            }
+        )
+    return networks
+
+
+def build_ipam_config(config_entries):
+    if not config_entries:
+        return None
+    pools = []
+    for entry in config_entries:
+        if not entry:
+            continue
+        pools.append(
+            docker_types.IPAMPool(
+                subnet=entry.get("Subnet"),
+                gateway=entry.get("Gateway"),
+                iprange=entry.get("IPRange"),
+                aux_addresses=entry.get("AuxiliaryAddresses"),
+            )
+        )
+    if not pools:
+        return None
+    return docker_types.IPAMConfig(pool_configs=pools)
+
+
+def ensure_network(client, network_entry):
+    network_name = network_entry.get("name")
+    if not network_name:
+        return None
+    try:
+        return client.networks.get(network_name)
+    except docker.errors.NotFound:
+        return client.networks.create(
+            name=network_name,
+            driver=network_entry.get("driver") or "bridge",
+            options=network_entry.get("options") or None,
+            labels=network_entry.get("labels") or None,
+            internal=network_entry.get("internal", False),
+            attachable=network_entry.get("attachable", False),
+            enable_ipv6=network_entry.get("enable_ipv6", False),
+            ipam=build_ipam_config(network_entry.get("ipam_config")),
+        )
+
+
+def reset_volume_contents(client, helper_image, volume_name):
+    cleanup_container = client.containers.create(
+        helper_image.id,
+        command=["sh", "-c", "rm -rf /volume/* /volume/.[!.]* /volume/..?* || true"],
+        volumes={volume_name: {"bind": "/volume", "mode": "rw"}},
+    )
+    try:
+        cleanup_container.start()
+        cleanup_container.wait(timeout=60)
+    finally:
+        cleanup_container.remove(force=True)
+
+
+def remove_images_by_tags(client, image_tags):
+    for tag in image_tags or []:
+        try:
+            image = client.images.get(tag)
+        except docker.errors.ImageNotFound:
+            continue
+        try:
+            image.remove(force=True)
+        except docker.errors.DockerException as exc:
+            log_docker_event(f"image_remove_error tag={tag} error={exc}", logging.WARNING)
+
+
 def restore_container_bundle(file_path, client=None):
     client = client or ensure_docker_client()
     if not client:
@@ -508,9 +602,14 @@ def restore_container_bundle(file_path, client=None):
                 tar.extractall(path=temp_dir, members=volume_members)
         with open(temp_dir / "manifest.json", "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
+        container_info = manifest.get("container", {})
+        image_tags = container_info.get("image_tags") or []
+        if image_tags:
+            remove_images_by_tags(client, image_tags)
         with open(temp_dir / "image.tar", "rb") as fh:
             client.images.load(fh.read())
         volume_entries = manifest.get("volumes", [])
+        network_entries = manifest.get("networks", [])
         helper_image = None
         if volume_entries:
             helper_image = ensure_helper_image(client)
@@ -521,6 +620,7 @@ def restore_container_bundle(file_path, client=None):
                 continue
             try:
                 client.volumes.get(volume_name)
+                reset_volume_contents(client, helper_image, volume_name)
             except docker.errors.NotFound:
                 client.volumes.create(name=volume_name)
             archive_path = temp_dir / "volumes" / f"{volume_name}.tar"
@@ -536,11 +636,11 @@ def restore_container_bundle(file_path, client=None):
                     helper_container.put_archive("/volume", fh.read())
             finally:
                 helper_container.remove(force=True)
-        container_info = manifest.get("container", {})
         container_name = container_info.get("name")
         config = container_info.get("config", {})
         host_config = container_info.get("host_config", {})
-        image_tags = container_info.get("image_tags") or []
+        for network_entry in network_entries:
+            ensure_network(client, network_entry)
         image_ref = image_tags[0] if image_tags else container_info.get("image_id")
         if not image_ref:
             raise RuntimeError("Image introuvable dans la sauvegarde.")
@@ -572,6 +672,25 @@ def restore_container_bundle(file_path, client=None):
             network_mode=network_mode if network_mode and network_mode != "default" else None,
         )
         container.start()
+        for network_entry in network_entries:
+            network_name = network_entry.get("name")
+            if not network_name or network_name in ("bridge", "host", "none"):
+                continue
+            if network_mode and network_mode == network_name:
+                continue
+            try:
+                network = client.networks.get(network_name)
+            except docker.errors.NotFound:
+                continue
+            aliases = network_entry.get("aliases") or None
+            ipv4_address = network_entry.get("ipv4_address") or None
+            ipv6_address = network_entry.get("ipv6_address") or None
+            network.connect(
+                container,
+                aliases=aliases,
+                ipv4_address=ipv4_address,
+                ipv6_address=ipv6_address,
+            )
         return removed_existing
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
