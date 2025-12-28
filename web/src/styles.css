@@ -8,43 +8,72 @@ body {
   margin: 0;
 }
 
-.layout {
-  display: flex;
+.app {
   min-height: 100vh;
-}
-
-.nav {
-  width: 240px;
-  background: #0f172a;
-  color: #fff;
-  padding: 24px;
-}
-
-.nav h1 {
-  margin: 0 0 16px 0;
-  font-size: 20px;
-}
-
-.links {
   display: flex;
   flex-direction: column;
-  gap: 10px;
 }
 
-.links a {
-  color: #cbd5f5;
-  text-decoration: none;
-  padding: 6px 0;
+.hero {
+  background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 55%, #2563eb 100%);
+  color: #f8fafc;
+  padding: 64px 8vw 48px;
 }
 
-.links a.active {
-  color: #fff;
-  font-weight: 600;
+.hero-content {
+  max-width: 960px;
+  margin: 0 auto;
 }
 
-.content {
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.hero h1 {
+  font-size: clamp(2.3rem, 4vw, 3.2rem);
+  margin: 16px 0 12px;
+}
+
+.hero p {
+  max-width: 640px;
+  font-size: 1.05rem;
+  color: rgba(248, 250, 252, 0.82);
+}
+
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 24px 0 32px;
+}
+
+.hero-meta {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+.main {
+  padding: 48px 8vw 64px;
   flex: 1;
-  padding: 32px;
+}
+
+.section {
+  max-width: 960px;
+  margin: 0 auto 32px;
+}
+
+.section > p {
+  color: #475569;
+  margin-bottom: 24px;
 }
 
 .card {
@@ -53,6 +82,34 @@ body {
   border-radius: 12px;
   box-shadow: 0 10px 20px rgba(15, 23, 42, 0.06);
   margin-bottom: 16px;
+}
+
+.hero .card {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f8fafc;
+  box-shadow: none;
+}
+
+.meta-title {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+  color: rgba(248, 250, 252, 0.75);
+}
+
+.meta-value {
+  margin: 0;
+  font-weight: 600;
+}
+
+.highlight {
+  background: #0f172a;
+  color: #f8fafc;
+}
+
+.highlight .steps {
+  color: rgba(248, 250, 252, 0.85);
 }
 
 .grid {
@@ -71,6 +128,12 @@ button {
 button.primary {
   background: #2563eb;
   color: #fff;
+}
+
+button.ghost {
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
 }
 
 button.danger {
