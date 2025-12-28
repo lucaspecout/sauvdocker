@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SauveDocker</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="logo">🛡️</span>
+        <div>
+          <h1>SauveDocker</h1>
+          <p>Backup & restauration</p>
+        </div>
+      </div>
+      {% if current_user.is_authenticated %}
+      <nav>
+        <a href="{{ url_for('dashboard') }}">Tableau de bord</a>
+        <a href="{{ url_for('settings') }}">Paramètres</a>
+        <a href="{{ url_for('setup_mfa') }}">MFA</a>
+        <a href="{{ url_for('logout') }}" class="danger">Déconnexion</a>
+      </nav>
+      {% endif %}
+      <div class="footer">
+        <p>Sécurité maximale activée</p>
+      </div>
+    </aside>
+    <main>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="flash-group">
+            {% for category, message in messages %}
+              <div class="flash {{ category }}">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

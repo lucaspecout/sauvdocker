@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connexion - SauveDocker</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="auth-body">
+  <div class="auth-card">
+    <div class="auth-header">
+      <span class="logo">🛡️</span>
+      <div>
+        <h1>Connexion admin</h1>
+        <p>Identifiants + MFA requis</p>
+      </div>
+    </div>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-group">
+          {% for category, message in messages %}
+            <div class="flash {{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+    <form method="post" class="auth-form">
+      <label>
+        Nom d'utilisateur
+        <input type="text" name="username" required>
+      </label>
+      <label>
+        Mot de passe
+        <input type="password" name="password" required>
+      </label>
+      <label>
+        Code MFA
+        <input type="text" name="otp" required>
+      </label>
+      <button type="submit">Se connecter</button>
+    </form>
+    <div class="hint">Mot de passe par défaut: <strong>Admin123!</strong></div>
+  </div>
+</body>
+</html>

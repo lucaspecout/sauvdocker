@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  sauvedocker:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./app/data:/app/app/data
+      - ./app/backups:/app/app/backups
+    environment:
+      - APP_SECRET=change-me
