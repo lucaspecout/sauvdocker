@@ -47,9 +47,30 @@ def build_docker_client(base_url):
     if not base_url:
         return None
     try:
-        return docker.DockerClient(base_url=base_url)
+        client = docker.DockerClient(base_url=base_url)
+        client.ping()
+        return client
     except (docker.errors.DockerException, InvalidURL):
         return None
+
+
+def socket_host(path):
+    return f"unix://{path}" if str(path).startswith("/") else f"unix:///{path}"
+
+
+def candidate_socket_hosts():
+    candidates = []
+    env_socket = os.environ.get("DOCKER_SOCKET")
+    if env_socket:
+        candidates.append(socket_host(env_socket))
+    for path in (
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        f"/run/user/{os.getuid()}/docker.sock",
+    ):
+        if Path(path).exists():
+            candidates.append(socket_host(path))
+    return candidates
 
 
 def get_docker_client():
@@ -63,27 +84,34 @@ def get_docker_client():
         errors.append(f"DOCKER_HOST={docker_host}")
 
     try:
-        return docker.from_env()
+        client = docker.from_env()
+        client.ping()
+        return client
     except (docker.errors.DockerException, InvalidURL) as exc:
         errors.append(str(exc))
-        pass
 
-    if Path("/var/run/docker.sock").exists():
-        fallback_host = "unix:///var/run/docker.sock"
+    for fallback_host in candidate_socket_hosts():
         os.environ["DOCKER_HOST"] = fallback_host
         client = build_docker_client(fallback_host)
         if client:
             return client
+
     details = f" Détails: {', '.join(errors)}." if errors else ""
     raise docker.errors.DockerException(
         "Impossible de créer un client Docker. Vérifiez que /var/run/docker.sock est monté et accessible, "
-        "ou configurez DOCKER_HOST correctement."
+        "ou configurez DOCKER_HOST/DOCKER_SOCKET correctement (ex: DOCKER_HOST=unix:///var/run/docker.sock)."
         f"{details}"
     )
 
 
 docker_client = None
 docker_error = None
+
+
+def reset_docker_client(error):
+    global docker_client, docker_error
+    docker_client = None
+    docker_error = error
 
 
 def ensure_docker_client():
@@ -292,9 +320,16 @@ def refresh_scheduler():
 def dashboard():
     client = ensure_docker_client()
     if client:
-        containers = client.containers.list(all=True)
-        images = client.images.list()
-        volumes = client.volumes.list()
+        try:
+            containers = client.containers.list(all=True)
+            images = client.images.list()
+            volumes = client.volumes.list()
+        except docker.errors.DockerException as exc:
+            reset_docker_client(str(exc))
+            containers = []
+            images = []
+            volumes = []
+            flash(docker_unavailable_message(), "error")
     else:
         containers = []
         images = []
@@ -407,8 +442,13 @@ def backup_container_route(container_id):
     if not client:
         flash(docker_unavailable_message(), "error")
         return redirect(url_for("dashboard"))
-    container = client.containers.get(container_id)
-    success = backup_container(container.id, container.name, client=client)
+    try:
+        container = client.containers.get(container_id)
+        success = backup_container(container.id, container.name, client=client)
+    except docker.errors.DockerException as exc:
+        reset_docker_client(str(exc))
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
     if success:
         flash("Sauvegarde du conteneur créée.", "success")
     else:
@@ -423,9 +463,14 @@ def backup_image_route(image_id):
     if not client:
         flash(docker_unavailable_message(), "error")
         return redirect(url_for("dashboard"))
-    image = client.images.get(image_id)
-    name = image.tags[0] if image.tags else image.short_id
-    success = backup_image(image.id, name, client=client)
+    try:
+        image = client.images.get(image_id)
+        name = image.tags[0] if image.tags else image.short_id
+        success = backup_image(image.id, name, client=client)
+    except docker.errors.DockerException as exc:
+        reset_docker_client(str(exc))
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
     if success:
         flash("Sauvegarde de l'image créée.", "success")
     else:
@@ -456,6 +501,9 @@ def restore_backup():
                 image = client.images.import_image(fh.read())
             client.containers.run(image.id, detach=True)
         flash("Restauration déclenchée.", "success")
+    except docker.errors.DockerException as exc:
+        reset_docker_client(str(exc))
+        flash(docker_unavailable_message(), "error")
     except Exception as exc:
         flash(f"Erreur de restauration: {exc}", "error")
     return redirect(url_for("dashboard"))
