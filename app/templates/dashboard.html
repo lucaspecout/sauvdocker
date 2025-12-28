@@ -26,9 +26,47 @@
             <p>ID: {{ container.short_id }}</p>
             <p>Status: {{ container.status }}</p>
           </div>
-          <form method="post" action="{{ url_for('backup_container_route', container_id=container.id) }}">
-            <button type="submit">Sauvegarder</button>
-          </form>
+          <div class="card-actions">
+            <form method="post" action="{{ url_for('backup_container_route', container_id=container.id) }}">
+              <button type="submit">Sauvegarder</button>
+            </form>
+            {% set schedule = schedules.get(container.name) %}
+            {% if schedule %}
+              {% set day_labels = namespace(items=[]) %}
+              {% for day in week_days %}
+                {% if day.value in schedule.days %}
+                  {% set _ = day_labels.items.append(day.label) %}
+                {% endif %}
+              {% endfor %}
+              <p class="schedule-summary">
+                Planifié {{ day_labels.items | join(', ') }} à {{ schedule.time }} (rétention {{ schedule.retention }})
+              </p>
+            {% else %}
+              <p class="schedule-summary">Planification inactive</p>
+            {% endif %}
+            <form method="post" action="{{ url_for('schedule_container', container_id=container.id) }}" class="schedule-form">
+              <div class="weekday-grid">
+                {% for day in week_days %}
+                  <label class="checkbox">
+                    <input type="checkbox" name="days" value="{{ day.value }}" {% if schedule and day.value in schedule.days %}checked{% endif %}>
+                    <span>{{ day.label }}</span>
+                  </label>
+                {% endfor %}
+              </div>
+              <label>
+                Heure de sauvegarde
+                <input type="time" name="time" value="{{ schedule.time if schedule else '' }}">
+              </label>
+              <label>
+                Rétention (sauvegardes)
+                <input type="number" name="retention" min="0" value="{{ schedule.retention if schedule else 20 }}">
+              </label>
+              <div class="schedule-actions">
+                <button type="submit" class="primary">Planifier</button>
+                <button type="submit" name="disable" value="1" class="ghost">Désactiver</button>
+              </div>
+            </form>
+          </div>
         </div>
       {% else %}
         <p>Aucun conteneur détecté.</p>

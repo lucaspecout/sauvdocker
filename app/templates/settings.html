@@ -5,11 +5,7 @@
   <h2>Paramètres d'automatisation</h2>
   <form method="post" class="form-grid">
     <label>
-      Intervalle de sauvegarde (minutes)
-      <input type="number" name="backup_interval" value="{{ backup_interval }}" min="5" required>
-    </label>
-    <label>
-      Nombre maximum de sauvegardes conservées
+      Nombre maximum de sauvegardes conservées (images)
       <input type="number" name="backup_retention" value="{{ backup_retention }}" min="0" required>
     </label>
     <button type="submit" class="primary">Mettre à jour</button>
