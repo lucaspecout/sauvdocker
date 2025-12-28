@@ -285,6 +285,16 @@ label {
   font-size: 13px;
 }
 
+.log-output {
+  background: var(--card);
+  padding: 16px;
+  border-radius: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  white-space: pre-wrap;
+  max-height: 60vh;
+  overflow: auto;
+}
+
 .mfa-box {
   background: var(--card);
   padding: 16px;

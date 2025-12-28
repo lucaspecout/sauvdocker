@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <h2>Logs Docker</h2>
+    <p class="hint">Fichier: {{ log_file }}</p>
+    <pre class="log-output">{% for line in log_lines %}{{ line }}{% endfor %}</pre>
+  </section>
+{% endblock %}

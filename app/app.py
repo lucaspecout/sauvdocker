@@ -5,6 +5,8 @@ import io
 from datetime import datetime
 from pathlib import Path
 import subprocess
+import logging
+from logging.handlers import RotatingFileHandler
 
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -21,6 +23,8 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 BACKUP_DIR = APP_DIR / "backups"
 DB_PATH = DATA_DIR / "app.db"
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE = LOG_DIR / "sauvedocker.log"
 
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "Admin123!"
@@ -31,6 +35,25 @@ app.secret_key = os.environ.get("APP_SECRET", "change-this-secret")
 login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.init_app(app)
+
+logger = logging.getLogger("sauvedocker")
+logger.setLevel(logging.INFO)
+
+
+def setup_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if logger.handlers:
+        return
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+def log_docker_event(message, level=logging.INFO):
+    setup_logging()
+    logger.log(level, message)
 
 def normalize_docker_host(docker_host):
     if not docker_host:
@@ -43,14 +66,15 @@ def normalize_docker_host(docker_host):
     return normalized
 
 
-def build_docker_client(base_url):
+def build_docker_client(base_url, source=""):
     if not base_url:
         return None
     try:
         client = docker.DockerClient(base_url=base_url)
         client.ping()
         return client
-    except (docker.errors.DockerException, InvalidURL):
+    except (docker.errors.DockerException, InvalidURL) as exc:
+        log_docker_event(f"docker_client_error source={source} base_url={base_url} error={exc}", logging.WARNING)
         return None
 
 
@@ -76,9 +100,15 @@ def candidate_socket_hosts():
 def get_docker_client():
     docker_host = normalize_docker_host(os.environ.get("DOCKER_HOST", ""))
     errors = []
+    log_docker_event(
+        "docker_client_init "
+        f"env_DOCKER_HOST={os.environ.get('DOCKER_HOST', '')} "
+        f"env_DOCKER_SOCKET={os.environ.get('DOCKER_SOCKET', '')}"
+    )
     if docker_host:
         os.environ["DOCKER_HOST"] = docker_host
-        client = build_docker_client(docker_host)
+        log_docker_event(f"docker_client_try source=env base_url={docker_host}")
+        client = build_docker_client(docker_host, source="env")
         if client:
             return client
         errors.append(f"DOCKER_HOST={docker_host}")
@@ -88,11 +118,13 @@ def get_docker_client():
         client.ping()
         return client
     except (docker.errors.DockerException, InvalidURL) as exc:
+        log_docker_event(f"docker_client_error source=from_env error={exc}", logging.WARNING)
         errors.append(str(exc))
 
     for fallback_host in candidate_socket_hosts():
         os.environ["DOCKER_HOST"] = fallback_host
-        client = build_docker_client(fallback_host)
+        log_docker_event(f"docker_client_try source=fallback base_url={fallback_host}")
+        client = build_docker_client(fallback_host, source="fallback")
         if client:
             return client
 
@@ -112,6 +144,7 @@ def reset_docker_client(error):
     global docker_client, docker_error
     docker_client = None
     docker_error = error
+    log_docker_event(f"docker_client_reset error={error}", logging.WARNING)
 
 
 def ensure_docker_client():
@@ -124,6 +157,7 @@ def ensure_docker_client():
         return docker_client
     except docker.errors.DockerException as exc:
         docker_error = str(exc)
+        log_docker_event(f"docker_client_unavailable error={docker_error}", logging.ERROR)
         return None
 
 
@@ -152,6 +186,7 @@ def load_user(user_id):
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    setup_logging()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -242,6 +277,15 @@ def run_drive_transfer(file_path):
     if not drive_command or not drive_target:
         return
     subprocess.run([drive_command, "copy", file_path, drive_target], check=False)
+
+
+def read_log_lines(max_lines=200):
+    setup_logging()
+    if not LOG_FILE.exists():
+        return []
+    with open(LOG_FILE, "r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    return lines[-max_lines:]
 
 
 def record_backup(target_type, target_name, file_path, status, error_message=None):
@@ -541,6 +585,15 @@ def settings():
         "drive_target": get_setting("drive_target", ""),
     }
     return render_template("settings.html", **context)
+
+
+@app.route("/logs")
+@login_required
+def logs():
+    log_lines = read_log_lines()
+    if not log_lines:
+        log_lines = ["Aucun log disponible pour le moment.\n"]
+    return render_template("logs.html", log_lines=log_lines, log_file=str(LOG_FILE))
 
 
 @app.route("/drive/transfer", methods=["POST"])
