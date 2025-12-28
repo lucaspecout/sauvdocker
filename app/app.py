@@ -69,7 +69,25 @@ def get_docker_client():
     raise docker.errors.DockerException("Unable to create Docker client with configured settings.")
 
 
-docker_client = get_docker_client()
+docker_client = None
+docker_error = None
+
+
+def ensure_docker_client():
+    global docker_client, docker_error
+    if docker_client:
+        return docker_client
+    try:
+        docker_client = get_docker_client()
+        docker_error = None
+        return docker_client
+    except docker.errors.DockerException as exc:
+        docker_error = str(exc)
+        return None
+
+
+def docker_unavailable_message():
+    return docker_error or "Docker indisponible."
 
 scheduler = BackgroundScheduler()
 
@@ -195,8 +213,11 @@ def record_backup(target_type, target_name, file_path, status, error_message=Non
         conn.commit()
 
 
-def backup_container(container_id, name=None):
-    container = docker_client.containers.get(container_id)
+def backup_container(container_id, name=None, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    container = client.containers.get(container_id)
     filename = f"container-{name or container.name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar"
     file_path = BACKUP_DIR / filename
     try:
@@ -213,8 +234,11 @@ def backup_container(container_id, name=None):
         return False
 
 
-def backup_image(image_id, name=None):
-    image = docker_client.images.get(image_id)
+def backup_image(image_id, name=None, client=None):
+    client = client or ensure_docker_client()
+    if not client:
+        raise docker.errors.DockerException(docker_unavailable_message())
+    image = client.images.get(image_id)
     filename = f"image-{name or image.short_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar"
     file_path = BACKUP_DIR / filename
     try:
@@ -233,13 +257,16 @@ def backup_image(image_id, name=None):
 
 
 def scheduled_backup():
-    containers = docker_client.containers.list(all=True)
-    images = docker_client.images.list()
+    client = ensure_docker_client()
+    if not client:
+        return
+    containers = client.containers.list(all=True)
+    images = client.images.list()
     for container in containers:
-        backup_container(container.id, container.name)
+        backup_container(container.id, container.name, client=client)
     for image in images:
         name = image.tags[0] if image.tags else image.short_id
-        backup_image(image.id, name)
+        backup_image(image.id, name, client=client)
 
 
 def refresh_scheduler():
@@ -251,8 +278,14 @@ def refresh_scheduler():
 @app.route("/")
 @login_required
 def dashboard():
-    containers = docker_client.containers.list(all=True)
-    images = docker_client.images.list()
+    client = ensure_docker_client()
+    if client:
+        containers = client.containers.list(all=True)
+        images = client.images.list()
+    else:
+        containers = []
+        images = []
+        flash(docker_unavailable_message(), "error")
     with sqlite3.connect(DB_PATH) as conn:
         backups = conn.execute(
             "SELECT id, target_type, target_name, file_path, created_at, status, error_message FROM backups ORDER BY created_at DESC"
@@ -347,8 +380,12 @@ def logout():
 @app.route("/backup/container/<container_id>", methods=["POST"])
 @login_required
 def backup_container_route(container_id):
-    container = docker_client.containers.get(container_id)
-    success = backup_container(container.id, container.name)
+    client = ensure_docker_client()
+    if not client:
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+    container = client.containers.get(container_id)
+    success = backup_container(container.id, container.name, client=client)
     if success:
         flash("Sauvegarde du conteneur créée.", "success")
     else:
@@ -359,9 +396,13 @@ def backup_container_route(container_id):
 @app.route("/backup/image/<image_id>", methods=["POST"])
 @login_required
 def backup_image_route(image_id):
-    image = docker_client.images.get(image_id)
+    client = ensure_docker_client()
+    if not client:
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
+    image = client.images.get(image_id)
     name = image.tags[0] if image.tags else image.short_id
-    success = backup_image(image.id, name)
+    success = backup_image(image.id, name, client=client)
     if success:
         flash("Sauvegarde de l'image créée.", "success")
     else:
@@ -379,14 +420,18 @@ def restore_backup():
         flash("Sauvegarde introuvable.", "error")
         return redirect(url_for("dashboard"))
     target_type, file_path = row
+    client = ensure_docker_client()
+    if not client:
+        flash(docker_unavailable_message(), "error")
+        return redirect(url_for("dashboard"))
     try:
         if target_type == "image":
             with open(file_path, "rb") as fh:
-                docker_client.images.load(fh.read())
+                client.images.load(fh.read())
         else:
             with open(file_path, "rb") as fh:
-                image = docker_client.images.import_image(fh.read())
-            docker_client.containers.run(image.id, detach=True)
+                image = client.images.import_image(fh.read())
+            client.containers.run(image.id, detach=True)
         flash("Restauration déclenchée.", "success")
     except Exception as exc:
         flash(f"Erreur de restauration: {exc}", "error")
