@@ -154,10 +154,9 @@ def ensure_admin_user():
         row = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USERNAME,)).fetchone()
         if row is None:
             password_hash = generate_password_hash(DEFAULT_ADMIN_PASSWORD)
-            mfa_secret = pyotp.random_base32()
             conn.execute(
                 "INSERT INTO users (username, password_hash, mfa_secret, force_password_change) VALUES (?, ?, ?, 1)",
-                (DEFAULT_ADMIN_USERNAME, password_hash, mfa_secret),
+                (DEFAULT_ADMIN_USERNAME, password_hash, None),
             )
             conn.commit()
 
@@ -317,13 +316,14 @@ def login():
         if not check_password_hash(user.password_hash, password):
             flash("Identifiants invalides", "error")
             return render_template("login.html")
+        if user.force_password_change:
+            login_user(user)
+            return redirect(url_for("force_password"))
         totp = pyotp.TOTP(user.mfa_secret)
         if not otp or not totp.verify(otp):
             flash("Code MFA invalide", "error")
             return render_template("login.html")
         login_user(user)
-        if user.force_password_change:
-            return redirect(url_for("force_password"))
         return redirect(url_for("dashboard"))
     return render_template("login.html")
 
