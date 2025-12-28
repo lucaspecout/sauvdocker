@@ -54,22 +54,30 @@ def build_docker_client(base_url):
 
 def get_docker_client():
     docker_host = normalize_docker_host(os.environ.get("DOCKER_HOST", ""))
+    errors = []
     if docker_host:
         os.environ["DOCKER_HOST"] = docker_host
         client = build_docker_client(docker_host)
         if client:
             return client
+        errors.append(f"DOCKER_HOST={docker_host}")
 
     try:
         return docker.from_env()
-    except (docker.errors.DockerException, InvalidURL):
+    except (docker.errors.DockerException, InvalidURL) as exc:
+        errors.append(str(exc))
         pass
 
     if Path("/var/run/docker.sock").exists():
         client = build_docker_client("unix://var/run/docker.sock")
         if client:
             return client
-    raise docker.errors.DockerException("Unable to create Docker client with configured settings.")
+    details = f" Détails: {', '.join(errors)}." if errors else ""
+    raise docker.errors.DockerException(
+        "Impossible de créer un client Docker. Vérifiez que /var/run/docker.sock est monté et accessible, "
+        "ou configurez DOCKER_HOST correctement."
+        f"{details}"
+    )
 
 
 docker_client = None
@@ -284,9 +292,11 @@ def dashboard():
     if client:
         containers = client.containers.list(all=True)
         images = client.images.list()
+        volumes = client.volumes.list()
     else:
         containers = []
         images = []
+        volumes = []
         flash(docker_unavailable_message(), "error")
     with sqlite3.connect(DB_PATH) as conn:
         backups = conn.execute(
@@ -296,6 +306,7 @@ def dashboard():
         "dashboard.html",
         containers=containers,
         images=images,
+        volumes=volumes,
         backups=backups,
         force_password_change=current_user.force_password_change,
     )

@@ -54,6 +54,22 @@
       {% endfor %}
     </div>
   </div>
+
+  <div class="panel">
+    <h3>Volumes détectés</h3>
+    <div class="card-list">
+      {% for volume in volumes %}
+        <div class="card">
+          <div>
+            <h4>{{ volume.name }}</h4>
+            <p>Driver: {{ volume.attrs.get("Driver", "local") }}</p>
+          </div>
+        </div>
+      {% else %}
+        <p>Aucun volume détecté.</p>
+      {% endfor %}
+    </div>
+  </div>
 </section>
 
 <section class="panel">
