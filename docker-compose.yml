@@ -6,7 +6,12 @@ services:
       - "6677:5000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./app/data:/app/app/data
-      - ./app/backups:/app/app/backups
+      - sauvedocker-data:/app/app/data
+      - sauvedocker-backups:/app/app/backups
     environment:
       - APP_SECRET=rtyzrhrthryrtrh
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+volumes:
+  sauvedocker-data:
+  sauvedocker-backups:
