@@ -32,7 +32,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       DOCKBACK_DATA_DIR: /data/backups
       DOCKBACK_SECRET_KEY: "${DOCKBACK_SECRET_KEY:-change-me}"
-      DOCKBACK_BASE_URL: "${DOCKBACK_BASE_URL:-http://localhost:8080}"
+      DOCKBACK_BASE_URL: "${DOCKBACK_BASE_URL:-http://localhost:8088}"
       DOCKBACK_ENCRYPTION_KEY_FILE: /run/secrets/dockback_encryption_key
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -43,7 +43,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "8080:8000"
+      - "8088:8000"
     secrets:
       - dockback_encryption_key
     healthcheck:
@@ -78,9 +78,9 @@ services:
   web:
     build: ./web
     environment:
-      VITE_API_BASE_URL: "${DOCKBACK_BASE_URL:-http://localhost:8080}"
+      VITE_API_BASE_URL: "${DOCKBACK_BASE_URL:-http://localhost:8088}"
     ports:
-      - "3000:80"
+      - "6677:80"
     depends_on:
       api:
         condition: service_healthy
