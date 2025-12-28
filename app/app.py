@@ -8,6 +8,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, ses
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 import docker
+from requests.exceptions import InvalidURL
 import pyotp
 from apscheduler.schedulers.background import BackgroundScheduler
 import smtplib
@@ -28,21 +29,44 @@ login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.init_app(app)
 
-def get_docker_client():
-    docker_host = os.environ.get("DOCKER_HOST", "").strip()
-    if docker_host.lower().startswith("http+docker://"):
-        docker_host = "unix:///var/run/docker.sock"
-        os.environ["DOCKER_HOST"] = docker_host
+def normalize_docker_host(docker_host):
+    if not docker_host:
+        return ""
+    normalized = docker_host.strip()
+    if normalized.lower().startswith("http+docker://"):
+        normalized = "unix://var/run/docker.sock"
+    if normalized.lower().startswith("unix:///"):
+        normalized = f"unix://{normalized[8:]}"
+    return normalized
 
+
+def build_docker_client(base_url):
+    if not base_url:
+        return None
+    try:
+        return docker.DockerClient(base_url=base_url)
+    except (docker.errors.DockerException, InvalidURL):
+        return None
+
+
+def get_docker_client():
+    docker_host = normalize_docker_host(os.environ.get("DOCKER_HOST", ""))
     if docker_host:
-        return docker.DockerClient(base_url=docker_host)
+        os.environ["DOCKER_HOST"] = docker_host
+        client = build_docker_client(docker_host)
+        if client:
+            return client
 
     try:
         return docker.from_env()
-    except docker.errors.DockerException:
-        if Path("/var/run/docker.sock").exists():
-            return docker.DockerClient(base_url="unix:///var/run/docker.sock")
-        raise
+    except (docker.errors.DockerException, InvalidURL):
+        pass
+
+    if Path("/var/run/docker.sock").exists():
+        client = build_docker_client("unix://var/run/docker.sock")
+        if client:
+            return client
+    raise docker.errors.DockerException("Unable to create Docker client with configured settings.")
 
 
 docker_client = get_docker_client()
