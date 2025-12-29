@@ -55,6 +55,7 @@
                   <span>Nom</span>
                   <span>Date</span>
                   <span>Statut</span>
+                  <span>Chiffrement</span>
                   <span>Actions</span>
                 </div>
                 {% for backup in history %}
@@ -66,6 +67,13 @@
                       <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
                       {% if backup[6] %}
                         <small class="error-detail">{{ backup[6] }}</small>
+                      {% endif %}
+                    </span>
+                    <span>
+                      {% if encrypted_backups.get(backup[0]) %}
+                        <span class="badge encrypted">Chiffrée</span>
+                      {% else %}
+                        <span class="badge">Non chiffrée</span>
                       {% endif %}
                     </span>
                     <span class="actions">
@@ -167,6 +175,7 @@
                   <span>Nom</span>
                   <span>Date</span>
                   <span>Statut</span>
+                  <span>Chiffrement</span>
                   <span>Actions</span>
                 </div>
                 {% for backup in history %}
@@ -178,6 +187,13 @@
                       <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
                       {% if backup[6] %}
                         <small class="error-detail">{{ backup[6] }}</small>
+                      {% endif %}
+                    </span>
+                    <span>
+                      {% if encrypted_backups.get(backup[0]) %}
+                        <span class="badge encrypted">Chiffrée</span>
+                      {% else %}
+                        <span class="badge">Non chiffrée</span>
                       {% endif %}
                     </span>
                     <span class="actions">
@@ -246,29 +262,37 @@
 
 <section class="panel">
   <h3>Historique des sauvegardes</h3>
-  <div class="table">
-    <div class="table-row header">
-      <span>Type</span>
-      <span>Nom</span>
-      <span>Date</span>
-      <span>Statut</span>
-      <span>Actions</span>
-    </div>
-    {% for backup in backups %}
-      <div class="table-row">
-        <span>{{ backup[1] }}</span>
-        <span>{{ backup[2] }}</span>
-        <span>{{ backup[4] }}</span>
-        <span>
-          <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
-          {% if backup[6] %}
-            <small class="error-detail">{{ backup[6] }}</small>
-          {% endif %}
-        </span>
-        <span class="actions">
-          <a href="{{ url_for('download_backup', filename=backup[3].split('/')[-1]) }}">Télécharger</a>
-          <form method="post" action="{{ url_for('restore_backup_task_route') }}" class="async-task">
-            <input type="hidden" name="backup_id" value="{{ backup[0] }}">
+    <div class="table">
+      <div class="table-row header">
+        <span>Type</span>
+        <span>Nom</span>
+        <span>Date</span>
+        <span>Statut</span>
+        <span>Chiffrement</span>
+        <span>Actions</span>
+      </div>
+      {% for backup in backups %}
+        <div class="table-row">
+          <span>{{ backup[1] }}</span>
+          <span>{{ backup[2] }}</span>
+          <span>{{ backup[4] }}</span>
+          <span>
+            <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+            {% if backup[6] %}
+              <small class="error-detail">{{ backup[6] }}</small>
+            {% endif %}
+          </span>
+          <span>
+            {% if encrypted_backups.get(backup[0]) %}
+              <span class="badge encrypted">Chiffrée</span>
+            {% else %}
+              <span class="badge">Non chiffrée</span>
+            {% endif %}
+          </span>
+          <span class="actions">
+            <a href="{{ url_for('download_backup', filename=backup[3].split('/')[-1]) }}">Télécharger</a>
+            <form method="post" action="{{ url_for('restore_backup_task_route') }}" class="async-task">
+              <input type="hidden" name="backup_id" value="{{ backup[0] }}">
             <button type="submit">Restaurer</button>
           </form>
           <form method="post" action="{{ url_for('delete_backup') }}">
@@ -285,5 +309,26 @@
       <p>Aucune sauvegarde encore.</p>
     {% endfor %}
   </div>
+</section>
+
+<section class="panel">
+  <h3>Importer une sauvegarde</h3>
+  <form method="post" action="{{ url_for('import_backup') }}" enctype="multipart/form-data" class="import-form">
+    <label>
+      Fichier de sauvegarde
+      <input type="file" name="backup_file" required>
+    </label>
+    <label>
+      Type de sauvegarde
+      <select name="target_type">
+        <option value="auto">Détection automatique</option>
+        <option value="container">Conteneur</option>
+        <option value="stack">Stack</option>
+        <option value="image">Image</option>
+      </select>
+    </label>
+    <p class="help-text">Les sauvegardes chiffrées nécessitent la clé définie dans les paramètres.</p>
+    <button type="submit">Importer</button>
+  </form>
 </section>
 {% endblock %}
