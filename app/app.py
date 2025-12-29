@@ -1774,6 +1774,45 @@ def run_restore_task(task_id, backup_id):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def run_import_task(task_id, destination, target_type):
+    update_task(task_id, status="running", progress=5, message="Validation de la sauvegarde")
+    try:
+        encrypted = is_encrypted_backup_file(destination)
+        if not encrypted and str(destination).endswith(".enc"):
+            raise RuntimeError("Fichier chiffré invalide.")
+        if encrypted and not str(destination).endswith(".enc"):
+            renamed = destination.with_name(f"{destination.name}.enc")
+            destination.rename(renamed)
+            destination = renamed
+        update_task(task_id, progress=25, message="Détection du type de sauvegarde")
+        detected_type = None
+        detected_name = None
+        if target_type == "auto":
+            detected_type, detected_name = detect_backup_metadata(destination)
+            target_type = detected_type
+        elif target_type not in {"container", "stack", "image"}:
+            raise RuntimeError("Type de sauvegarde invalide.")
+        if not target_type:
+            raise RuntimeError("Impossible de détecter le type de sauvegarde.")
+        if not detected_name:
+            detected_name = Path(destination).stem
+        update_task(
+            task_id,
+            target_type=target_type,
+            target_name=detected_name,
+            progress=70,
+            message="Enregistrement de la sauvegarde",
+        )
+        record_backup(target_type, detected_name, str(destination), "imported")
+        update_task(task_id, status="success", progress=100, message="Sauvegarde importée")
+    except Exception as exc:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        update_task(task_id, status="failed", progress=100, message="Erreur d'import", details=str(exc))
+
+
 @app.route("/tasks/<task_id>")
 @login_required
 def task_status_route(task_id):
@@ -2060,14 +2099,13 @@ def download_backup(filename):
     return send_from_directory(BACKUP_DIR, filename, as_attachment=True)
 
 
-@app.route("/backup/import", methods=["POST"])
+@app.route("/tasks/backup/import", methods=["POST"])
 @login_required
-def import_backup():
+def import_backup_task_route():
     uploaded = request.files.get("backup_file")
     target_type = request.form.get("target_type", "auto")
     if not uploaded or not uploaded.filename:
-        flash("Fichier de sauvegarde manquant.", "error")
-        return redirect(url_for("dashboard"))
+        return jsonify({"error": "Fichier de sauvegarde manquant."}), 400
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     filename = secure_filename(uploaded.filename)
     if not filename:
@@ -2075,36 +2113,14 @@ def import_backup():
     destination = BACKUP_DIR / filename
     if destination.exists():
         destination = BACKUP_DIR / f"{destination.stem}-{uuid.uuid4().hex}{destination.suffix}"
-    uploaded.save(destination)
     try:
-        encrypted = is_encrypted_backup_file(destination)
-        if not encrypted and str(destination).endswith(".enc"):
-            raise RuntimeError("Fichier chiffré invalide.")
-        if encrypted and not str(destination).endswith(".enc"):
-            renamed = destination.with_name(f"{destination.name}.enc")
-            destination.rename(renamed)
-            destination = renamed
-        detected_type = None
-        detected_name = None
-        if target_type == "auto":
-            detected_type, detected_name = detect_backup_metadata(destination)
-            target_type = detected_type
-        elif target_type not in {"container", "stack", "image"}:
-            raise RuntimeError("Type de sauvegarde invalide.")
-        if not target_type:
-            raise RuntimeError("Impossible de détecter le type de sauvegarde.")
-        if not detected_name:
-            detected_name = Path(destination).stem
-        record_backup(target_type, detected_name, str(destination), "imported")
-    except Exception as exc:
-        try:
-            destination.unlink()
-        except OSError:
-            pass
-        flash(f"Erreur d'import: {exc}", "error")
-        return redirect(url_for("dashboard"))
-    flash("Sauvegarde importée.", "success")
-    return redirect(url_for("dashboard"))
+        uploaded.save(destination)
+    except OSError as exc:
+        return jsonify({"error": f"Impossible d'enregistrer le fichier: {exc}"}), 500
+    task_id = start_task("Import sauvegarde", "import", filename)
+    thread = threading.Thread(target=run_import_task, args=(task_id, destination, target_type), daemon=True)
+    thread.start()
+    return jsonify({"task_id": task_id})
 
 
 @app.route("/backup/delete", methods=["POST"])

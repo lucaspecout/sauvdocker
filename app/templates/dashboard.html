@@ -313,7 +313,7 @@
 
 <section class="panel">
   <h3>Importer une sauvegarde</h3>
-  <form method="post" action="{{ url_for('import_backup') }}" enctype="multipart/form-data" class="import-form">
+  <form method="post" action="{{ url_for('import_backup_task_route') }}" enctype="multipart/form-data" class="import-form async-task">
     <label>
       Fichier de sauvegarde
       <input type="file" name="backup_file" required>
