@@ -19,6 +19,7 @@ from logging.handlers import RotatingFileHandler
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory, jsonify
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 import docker
 from requests.exceptions import InvalidURL
 from docker import types as docker_types
@@ -450,6 +451,43 @@ def maybe_encrypt_backup(file_path):
     except OSError as exc:
         log_docker_event(f"backup_encrypt_cleanup_error path={file_path} error={exc}", logging.WARNING)
     return encrypted_path, True
+
+
+def is_encrypted_backup_file(file_path):
+    path = Path(file_path)
+    if not path.exists():
+        return False
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(len(ENC_HEADER))
+    except OSError as exc:
+        log_docker_event(f"backup_encryption_check_error path={file_path} error={exc}", logging.WARNING)
+        return False
+    return header == ENC_HEADER
+
+
+def detect_backup_metadata(file_path):
+    working_path, temp_dir = prepare_restore_file(file_path)
+    try:
+        if tarfile.is_tarfile(working_path):
+            with tarfile.open(working_path, "r") as tar:
+                try:
+                    manifest_member = tar.getmember("manifest.json")
+                except KeyError:
+                    return "image", None
+                manifest_file = tar.extractfile(manifest_member)
+                if not manifest_file:
+                    return "image", None
+                manifest = json.load(manifest_file)
+            if "stack" in manifest:
+                return "stack", (manifest.get("stack") or {}).get("name")
+            if "container" in manifest:
+                return "container", (manifest.get("container") or {}).get("name")
+            return "container", None
+        return "image", None
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def record_backup(target_type, target_name, file_path, status, error_message=None):
@@ -1485,6 +1523,7 @@ def dashboard():
         backups = conn.execute(
             "SELECT id, target_type, target_name, file_path, created_at, status, error_message FROM backups ORDER BY created_at DESC"
         ).fetchall()
+    encrypted_backups = {backup[0]: is_encrypted_backup_file(backup[3]) for backup in backups}
     container_backups = {}
     stack_backups = {}
     for backup in backups:
@@ -1504,6 +1543,7 @@ def dashboard():
         containers=containers,
         stacks=stacks,
         backups=backups,
+        encrypted_backups=encrypted_backups,
         container_backups=container_backups,
         latest_container_backups=latest_container_backups,
         stack_backups=stack_backups,
@@ -1675,7 +1715,10 @@ def run_image_backup_task(task_id, image_id):
 
 
 def prepare_restore_file(file_path, task_id=None):
-    if not str(file_path).endswith(".enc"):
+    encrypted = is_encrypted_backup_file(file_path)
+    if not encrypted:
+        if str(file_path).endswith(".enc"):
+            raise RuntimeError("Fichier chiffré invalide.")
         return Path(file_path), None
     update_task(task_id, status="running", progress=10, message="Déchiffrement de la sauvegarde")
     temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-restore-dec-"))
@@ -2007,7 +2050,61 @@ def schedule_stack(stack_name):
 @app.route("/download/<path:filename>")
 @login_required
 def download_backup(filename):
+    file_path = BACKUP_DIR / filename
+    if not file_path.exists():
+        flash("Sauvegarde introuvable.", "error")
+        return redirect(url_for("dashboard"))
+    if str(file_path).endswith(".enc") and not is_encrypted_backup_file(file_path):
+        flash("Sauvegarde chiffrée invalide.", "error")
+        return redirect(url_for("dashboard"))
     return send_from_directory(BACKUP_DIR, filename, as_attachment=True)
+
+
+@app.route("/backup/import", methods=["POST"])
+@login_required
+def import_backup():
+    uploaded = request.files.get("backup_file")
+    target_type = request.form.get("target_type", "auto")
+    if not uploaded or not uploaded.filename:
+        flash("Fichier de sauvegarde manquant.", "error")
+        return redirect(url_for("dashboard"))
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    filename = secure_filename(uploaded.filename)
+    if not filename:
+        filename = f"backup-{uuid.uuid4().hex}"
+    destination = BACKUP_DIR / filename
+    if destination.exists():
+        destination = BACKUP_DIR / f"{destination.stem}-{uuid.uuid4().hex}{destination.suffix}"
+    uploaded.save(destination)
+    try:
+        encrypted = is_encrypted_backup_file(destination)
+        if not encrypted and str(destination).endswith(".enc"):
+            raise RuntimeError("Fichier chiffré invalide.")
+        if encrypted and not str(destination).endswith(".enc"):
+            renamed = destination.with_name(f"{destination.name}.enc")
+            destination.rename(renamed)
+            destination = renamed
+        detected_type = None
+        detected_name = None
+        if target_type == "auto":
+            detected_type, detected_name = detect_backup_metadata(destination)
+            target_type = detected_type
+        elif target_type not in {"container", "stack", "image"}:
+            raise RuntimeError("Type de sauvegarde invalide.")
+        if not target_type:
+            raise RuntimeError("Impossible de détecter le type de sauvegarde.")
+        if not detected_name:
+            detected_name = Path(destination).stem
+        record_backup(target_type, detected_name, str(destination), "imported")
+    except Exception as exc:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        flash(f"Erreur d'import: {exc}", "error")
+        return redirect(url_for("dashboard"))
+    flash("Sauvegarde importée.", "success")
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/backup/delete", methods=["POST"])
