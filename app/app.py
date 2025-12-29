@@ -826,6 +826,29 @@ def ensure_network(client, network_entry):
         )
 
 
+def connect_container_network(container, network, network_entry):
+    aliases = network_entry.get("aliases") or None
+    ipv4_address = network_entry.get("ipv4_address") or None
+    ipv6_address = network_entry.get("ipv6_address") or None
+    try:
+        network.connect(
+            container,
+            aliases=aliases,
+            ipv4_address=ipv4_address,
+            ipv6_address=ipv6_address,
+        )
+    except docker.errors.APIError as exc:
+        if ipv4_address or ipv6_address:
+            log_docker_event(
+                "network_connect_retry "
+                f"container={container.name} network={network.name} error={exc}",
+                logging.WARNING,
+            )
+            network.connect(container, aliases=aliases)
+        else:
+            raise
+
+
 def reset_volume_contents(client, helper_image, volume_name):
     cleanup_container = client.containers.create(
         helper_image.id,
@@ -972,15 +995,7 @@ def restore_container_bundle(file_path, client=None):
                 network = client.networks.get(network_name)
             except docker.errors.NotFound:
                 continue
-            aliases = network_entry.get("aliases") or None
-            ipv4_address = network_entry.get("ipv4_address") or None
-            ipv6_address = network_entry.get("ipv6_address") or None
-            network.connect(
-                container,
-                aliases=aliases,
-                ipv4_address=ipv4_address,
-                ipv6_address=ipv6_address,
-            )
+            connect_container_network(container, network, network_entry)
         return removed_existing
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1104,12 +1119,7 @@ def restore_stack_bundle(file_path, client=None):
                     network = client.networks.get(network_name)
                 except docker.errors.NotFound:
                     continue
-                network.connect(
-                    container,
-                    aliases=network_entry.get("aliases") or None,
-                    ipv4_address=network_entry.get("ipv4_address") or None,
-                    ipv6_address=network_entry.get("ipv6_address") or None,
-                )
+                connect_container_network(container, network, network_entry)
         return True
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
