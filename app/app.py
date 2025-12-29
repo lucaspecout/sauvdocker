@@ -856,7 +856,15 @@ def import_container_backup(file_path, client=None):
         raise docker.errors.DockerException(docker_unavailable_message())
     before_images = {image.id for image in client.images.list()}
     with open(file_path, "rb") as fh:
-        client.api.import_image(fh.read())
+        loaded = client.images.load(fh.read())
+    loaded_images = []
+    if isinstance(loaded, list):
+        loaded_images = loaded
+    elif isinstance(loaded, tuple) and loaded and isinstance(loaded[0], list):
+        loaded_images = loaded[0]
+    if loaded_images:
+        return loaded_images[0]
+    before_images = {image.id for image in client.images.list()}
     after_images = client.images.list()
     new_images = [image for image in after_images if image.id not in before_images]
     if not new_images:
