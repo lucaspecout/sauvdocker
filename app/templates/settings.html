@@ -8,6 +8,10 @@
       Nombre maximum de sauvegardes conservées (images)
       <input type="number" name="backup_retention" value="{{ backup_retention }}" min="0" required>
     </label>
+    <label>
+      Clé de chiffrement des sauvegardes
+      <input type="password" name="backup_encryption_key" value="{{ backup_encryption_key }}" placeholder="Définir une clé forte">
+    </label>
     <button type="submit" class="primary">Mettre à jour</button>
   </form>
 </section>
