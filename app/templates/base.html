@@ -42,5 +42,97 @@
       {% block content %}{% endblock %}
     </main>
   </div>
+  <div id="task-overlay" class="progress-overlay" aria-hidden="true">
+    <div class="progress-card">
+      <strong id="task-title">Opération en cours</strong>
+      <div class="progress-bar"><span id="task-progress"></span></div>
+      <div class="progress-meta">
+        <span id="task-message">Initialisation...</span>
+        <span id="task-percent">0%</span>
+      </div>
+      <div id="task-details" class="hint"></div>
+      <button type="button" id="task-close" class="ghost">Fermer</button>
+    </div>
+  </div>
+  <script>
+    const overlay = document.getElementById("task-overlay");
+    const titleEl = document.getElementById("task-title");
+    const messageEl = document.getElementById("task-message");
+    const percentEl = document.getElementById("task-percent");
+    const progressEl = document.getElementById("task-progress");
+    const detailsEl = document.getElementById("task-details");
+    const closeBtn = document.getElementById("task-close");
+
+    const showOverlay = () => {
+      overlay.classList.add("active");
+      overlay.setAttribute("aria-hidden", "false");
+    };
+
+    const hideOverlay = () => {
+      overlay.classList.remove("active");
+      overlay.setAttribute("aria-hidden", "true");
+    };
+
+    const updateOverlay = (data) => {
+      const progress = Math.min(100, Math.max(0, data.progress || 0));
+      titleEl.textContent = data.target_name
+        ? `${data.target_type || "Tâche"} : ${data.target_name}`
+        : "Opération en cours";
+      messageEl.textContent = data.message || "Traitement en cours";
+      percentEl.textContent = `${progress}%`;
+      progressEl.style.width = `${progress}%`;
+      detailsEl.textContent = data.details || "";
+    };
+
+    const pollTask = async (taskId) => {
+      try {
+        const response = await fetch(`/tasks/${taskId}`);
+        const data = await response.json();
+        updateOverlay(data);
+        if (data.status === "success" || data.status === "failed") {
+          closeBtn.textContent = "Actualiser";
+          closeBtn.dataset.refresh = "true";
+          return;
+        }
+      } catch (error) {
+        updateOverlay({ message: "Erreur de suivi", details: error.toString(), progress: 100 });
+        closeBtn.textContent = "Fermer";
+        return;
+      }
+      setTimeout(() => pollTask(taskId), 1500);
+    };
+
+    closeBtn.addEventListener("click", () => {
+      if (closeBtn.dataset.refresh === "true") {
+        window.location.reload();
+      } else {
+        hideOverlay();
+      }
+    });
+
+    document.querySelectorAll("form.async-task").forEach((form) => {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        closeBtn.dataset.refresh = "false";
+        closeBtn.textContent = "Fermer";
+        showOverlay();
+        updateOverlay({ message: "Démarrage de la tâche", progress: 0, details: "" });
+        try {
+          const response = await fetch(form.action, {
+            method: form.method || "POST",
+            body: new FormData(form),
+          });
+          const data = await response.json();
+          if (!data.task_id) {
+            updateOverlay({ message: "Erreur", details: data.error || "Impossible de démarrer la tâche", progress: 100 });
+            return;
+          }
+          pollTask(data.task_id);
+        } catch (error) {
+          updateOverlay({ message: "Erreur", details: error.toString(), progress: 100 });
+        }
+      });
+    });
+  </script>
 </body>
 </html>

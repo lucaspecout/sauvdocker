@@ -40,10 +40,10 @@
             {% endif %}
           </div>
           <div class="card-actions">
-            <form method="post" action="{{ url_for('backup_stack_route', stack_name=stack_name) }}">
+            <form method="post" action="{{ url_for('backup_stack_task_route', stack_name=stack_name) }}" class="async-task">
               <button type="submit">Sauvegarder la stack</button>
             </form>
-            <form method="post" action="{{ url_for('backup_stack_db_safe_route', stack_name=stack_name) }}">
+            <form method="post" action="{{ url_for('backup_stack_db_safe_task_route', stack_name=stack_name) }}" class="async-task">
               <button type="submit" class="ghost">Sauvegarde stack (arrêt DB)</button>
             </form>
             <details class="history-details">
@@ -62,10 +62,15 @@
                     <span>{{ backup[1] }}</span>
                     <span>{{ backup[2] }}</span>
                     <span>{{ backup[4] }}</span>
-                    <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+                    <span>
+                      <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+                      {% if backup[6] %}
+                        <small class="error-detail">{{ backup[6] }}</small>
+                      {% endif %}
+                    </span>
                     <span class="actions">
                       <a href="{{ url_for('download_backup', filename=backup[3].split('/')[-1]) }}">Télécharger</a>
-                      <form method="post" action="{{ url_for('restore_backup') }}">
+                      <form method="post" action="{{ url_for('restore_backup_task_route') }}" class="async-task">
                         <input type="hidden" name="backup_id" value="{{ backup[0] }}">
                         <button type="submit">Restaurer</button>
                       </form>
@@ -80,6 +85,48 @@
                 {% endfor %}
               </div>
             </details>
+            {% set stack_schedule = stack_schedules.get(stack_name) %}
+            {% if stack_schedule %}
+              {% set stack_day_labels = namespace(items=[]) %}
+              {% for day in week_days %}
+                {% if day.value in stack_schedule.days %}
+                  {% set _ = stack_day_labels.items.append(day.label) %}
+                {% endif %}
+              {% endfor %}
+              <p class="schedule-summary">
+                Planifié {{ stack_day_labels.items | join(', ') }} à {{ stack_schedule.time }}
+                (rétention {{ stack_schedule.retention }})
+                {% if stack_schedule.db_safe %}(arrêt DB){% endif %}
+              </p>
+            {% else %}
+              <p class="schedule-summary">Planification stack inactive</p>
+            {% endif %}
+            <form method="post" action="{{ url_for('schedule_stack', stack_name=stack_name) }}" class="schedule-form">
+              <div class="weekday-grid">
+                {% for day in week_days %}
+                  <label class="checkbox">
+                    <input type="checkbox" name="days" value="{{ day.value }}" {% if stack_schedule and day.value in stack_schedule.days %}checked{% endif %}>
+                    <span>{{ day.label }}</span>
+                  </label>
+                {% endfor %}
+              </div>
+              <label>
+                Heure de sauvegarde
+                <input type="time" name="time" value="{{ stack_schedule.time if stack_schedule else '' }}">
+              </label>
+              <label>
+                Rétention (sauvegardes)
+                <input type="number" name="retention" min="0" value="{{ stack_schedule.retention if stack_schedule else 20 }}">
+              </label>
+              <label class="checkbox inline">
+                <input type="checkbox" name="db_safe" value="1" {% if stack_schedule and stack_schedule.db_safe %}checked{% endif %}>
+                <span>Arrêt des DB pendant la sauvegarde</span>
+              </label>
+              <div class="schedule-actions">
+                <button type="submit" class="primary">Planifier</button>
+                <button type="submit" name="disable" value="1" class="ghost">Désactiver</button>
+              </div>
+            </form>
           </div>
         </div>
       {% else %}
@@ -108,7 +155,7 @@
             {% endif %}
           </div>
           <div class="card-actions">
-            <form method="post" action="{{ url_for('backup_container_route', container_id=container.id) }}">
+            <form method="post" action="{{ url_for('backup_container_task_route', container_id=container.id) }}" class="async-task">
               <button type="submit">Sauvegarder</button>
             </form>
             <details class="history-details">
@@ -127,10 +174,15 @@
                     <span>{{ backup[1] }}</span>
                     <span>{{ backup[2] }}</span>
                     <span>{{ backup[4] }}</span>
-                    <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+                    <span>
+                      <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+                      {% if backup[6] %}
+                        <small class="error-detail">{{ backup[6] }}</small>
+                      {% endif %}
+                    </span>
                     <span class="actions">
                       <a href="{{ url_for('download_backup', filename=backup[3].split('/')[-1]) }}">Télécharger</a>
-                      <form method="post" action="{{ url_for('restore_backup') }}">
+                      <form method="post" action="{{ url_for('restore_backup_task_route') }}" class="async-task">
                         <input type="hidden" name="backup_id" value="{{ backup[0] }}">
                         <button type="submit">Restaurer</button>
                       </form>
@@ -207,10 +259,15 @@
         <span>{{ backup[1] }}</span>
         <span>{{ backup[2] }}</span>
         <span>{{ backup[4] }}</span>
-        <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+        <span>
+          <span class="status {{ backup[5] }}">{{ backup[5] }}</span>
+          {% if backup[6] %}
+            <small class="error-detail">{{ backup[6] }}</small>
+          {% endif %}
+        </span>
         <span class="actions">
           <a href="{{ url_for('download_backup', filename=backup[3].split('/')[-1]) }}">Télécharger</a>
-          <form method="post" action="{{ url_for('restore_backup') }}">
+          <form method="post" action="{{ url_for('restore_backup_task_route') }}" class="async-task">
             <input type="hidden" name="backup_id" value="{{ backup[0] }}">
             <button type="submit">Restaurer</button>
           </form>

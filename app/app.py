@@ -10,9 +10,13 @@ import tarfile
 import tempfile
 import shutil
 import logging
+import threading
+import uuid
+import hashlib
+import hmac
 from logging.handlers import RotatingFileHandler
 
-from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory, jsonify
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 import docker
@@ -34,6 +38,10 @@ LOG_FILE = LOG_DIR / "sauvedocker.log"
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "Admin123!"
 STACK_LABEL_KEYS = ("com.docker.stack.namespace", "com.docker.compose.project")
+ENC_HEADER = b"SDENC1"
+ENC_IV_SIZE = 16
+ENC_HMAC_SIZE = 32
+ENC_CHUNK_SIZE = 1024 * 1024
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("APP_SECRET", "change-this-secret")
@@ -171,6 +179,8 @@ def docker_unavailable_message():
     return docker_error or "Docker indisponible."
 
 scheduler = BackgroundScheduler()
+task_status = {}
+task_lock = threading.Lock()
 
 
 class User(UserMixin):
@@ -233,6 +243,17 @@ def init_db():
                 days TEXT NOT NULL,
                 time TEXT NOT NULL,
                 retention INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stack_schedules (
+                stack_name TEXT PRIMARY KEY,
+                days TEXT NOT NULL,
+                time TEXT NOT NULL,
+                retention INTEGER NOT NULL,
+                db_safe INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -311,6 +332,126 @@ def read_log_lines(max_lines=200):
     return lines[-max_lines:]
 
 
+def update_task(task_id, **updates):
+    if not task_id:
+        return
+    with task_lock:
+        task = task_status.get(task_id, {})
+        task.update(updates)
+        task_status[task_id] = task
+
+
+def get_task(task_id):
+    with task_lock:
+        return task_status.get(task_id, {}).copy()
+
+
+def get_encryption_key():
+    return get_setting("backup_encryption_key")
+
+
+def encrypt_file(source_path, destination_path, secret):
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import padding
+    except ImportError as exc:
+        raise RuntimeError("Le chiffrement nécessite le module cryptography.") from exc
+    if not secret:
+        raise RuntimeError("Clé de chiffrement manquante.")
+    key = hashlib.sha256(secret.encode("utf-8")).digest()
+    iv = os.urandom(ENC_IV_SIZE)
+    hmac_key = hashlib.sha256((secret + "hmac").encode("utf-8")).digest()
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    padder = padding.PKCS7(128).padder()
+    hmac_ctx = hmac.new(hmac_key, digestmod=hashlib.sha256)
+    total_size = Path(source_path).stat().st_size
+    processed = 0
+    with open(source_path, "rb") as source, open(destination_path, "wb") as target:
+        target.write(ENC_HEADER)
+        target.write(iv)
+        while True:
+            chunk = source.read(ENC_CHUNK_SIZE)
+            if not chunk:
+                break
+            processed += len(chunk)
+            padded = padder.update(chunk)
+            if padded:
+                encrypted = encryptor.update(padded)
+                target.write(encrypted)
+                hmac_ctx.update(encrypted)
+        padded_final = padder.finalize()
+        encrypted_final = encryptor.update(padded_final) + encryptor.finalize()
+        if encrypted_final:
+            target.write(encrypted_final)
+            hmac_ctx.update(encrypted_final)
+        target.write(hmac_ctx.digest())
+    return total_size, processed
+
+
+def decrypt_file(source_path, destination_path, secret):
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import padding
+    except ImportError as exc:
+        raise RuntimeError("Le déchiffrement nécessite le module cryptography.") from exc
+    if not secret:
+        raise RuntimeError("Clé de chiffrement manquante.")
+    source_size = Path(source_path).stat().st_size
+    if source_size < len(ENC_HEADER) + ENC_IV_SIZE + ENC_HMAC_SIZE:
+        raise RuntimeError("Fichier chiffré invalide.")
+    cipher_size = source_size - len(ENC_HEADER) - ENC_IV_SIZE - ENC_HMAC_SIZE
+    hmac_key = hashlib.sha256((secret + "hmac").encode("utf-8")).digest()
+    hmac_ctx = hmac.new(hmac_key, digestmod=hashlib.sha256)
+    key = hashlib.sha256(secret.encode("utf-8")).digest()
+    processed = 0
+    with open(source_path, "rb") as source, open(destination_path, "wb") as target:
+        header = source.read(len(ENC_HEADER))
+        if header != ENC_HEADER:
+            raise RuntimeError("Fichier chiffré invalide.")
+        iv = source.read(ENC_IV_SIZE)
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        unpadder = padding.PKCS7(128).unpadder()
+        remaining = cipher_size
+        while remaining > 0:
+            chunk = source.read(min(ENC_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            processed += len(chunk)
+            hmac_ctx.update(chunk)
+            padded = decryptor.update(chunk)
+            if padded:
+                target.write(unpadder.update(padded))
+        file_hmac = source.read(ENC_HMAC_SIZE)
+        if not hmac.compare_digest(hmac_ctx.digest(), file_hmac):
+            target.close()
+            try:
+                Path(destination_path).unlink()
+            except OSError:
+                pass
+            raise RuntimeError("Clé de chiffrement invalide ou fichier corrompu.")
+        padded_final = decryptor.finalize()
+        target.write(unpadder.update(padded_final) + unpadder.finalize())
+    return cipher_size, processed
+
+
+def maybe_encrypt_backup(file_path):
+    encryption_key = get_encryption_key()
+    if not encryption_key:
+        return file_path, False
+    encrypted_path = f"{file_path}.enc"
+    encrypt_file(file_path, encrypted_path, encryption_key)
+    try:
+        Path(file_path).unlink()
+    except OSError as exc:
+        log_docker_event(f"backup_encrypt_cleanup_error path={file_path} error={exc}", logging.WARNING)
+    return encrypted_path, True
+
+
 def record_backup(target_type, target_name, file_path, status, error_message=None):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -356,7 +497,7 @@ def cleanup_old_backups(max_keep, target_type=None, target_name=None):
             log_docker_event(f"backup_cleanup_error path={file_path} error={exc}", logging.WARNING)
 
 
-def backup_container(container_id, name=None, client=None, retention=None):
+def backup_container(container_id, name=None, client=None, retention=None, task_id=None):
     client = client or ensure_docker_client()
     if not client:
         raise docker.errors.DockerException(docker_unavailable_message())
@@ -364,8 +505,10 @@ def backup_container(container_id, name=None, client=None, retention=None):
     filename = f"container-{name or container.name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar"
     file_path = BACKUP_DIR / filename
     try:
+        update_task(task_id, status="running", progress=5, message="Préparation de la sauvegarde")
         temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-backup-"))
         try:
+            update_task(task_id, progress=10, message="Sauvegarde de l'image")
             image = container.image
             image_tar_path = temp_dir / "image.tar"
             with open(image_tar_path, "wb") as fh:
@@ -381,6 +524,7 @@ def backup_container(container_id, name=None, client=None, retention=None):
                 destination = mount.get("Destination")
                 if not volume_name or not destination:
                     continue
+                update_task(task_id, message=f"Sauvegarde du volume {volume_name}")
                 volume_tar_path = volumes_dir / f"{volume_name}.tar"
                 archive_path = f"{destination.rstrip('/')}/."
                 archive_stream, _ = container.get_archive(archive_path)
@@ -416,19 +560,29 @@ def backup_container(container_id, name=None, client=None, retention=None):
                     tar.add(volumes_dir, arcname="volumes")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        record_backup("container", name or container.name, str(file_path), "success")
+        update_task(task_id, progress=85, message="Chiffrement de la sauvegarde")
+        encrypted_file_path, encrypted = maybe_encrypt_backup(file_path)
+        record_backup("container", name or container.name, str(encrypted_file_path), "success")
         retention_value = retention if retention is not None else get_int_setting("backup_retention", 20)
         cleanup_old_backups(retention_value, target_type="container", target_name=name or container.name)
-        run_drive_transfer(str(file_path))
+        run_drive_transfer(str(encrypted_file_path))
         send_alert("Sauvegarde container réussie", f"Sauvegarde créée pour {name or container.name}")
-        return True
+        update_task(
+            task_id,
+            status="success",
+            progress=100,
+            message="Sauvegarde terminée",
+            details="Sauvegarde chiffrée." if encrypted else "Sauvegarde terminée.",
+        )
+        return True, None
     except Exception as exc:
         record_backup("container", name or container.name, str(file_path), "failed", str(exc))
         send_alert("Sauvegarde container échouée", f"Erreur pour {name or container.name}: {exc}")
-        return False
+        update_task(task_id, status="failed", progress=100, message="Échec de la sauvegarde", details=str(exc))
+        return False, str(exc)
 
 
-def backup_stack(stack_name, client=None):
+def backup_stack(stack_name, client=None, task_id=None):
     client = client or ensure_docker_client()
     if not client:
         raise docker.errors.DockerException(docker_unavailable_message())
@@ -442,6 +596,7 @@ def backup_stack(stack_name, client=None):
     filename = f"stack-{stack_name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar"
     file_path = BACKUP_DIR / filename
     try:
+        update_task(task_id, status="running", progress=5, message="Préparation de la sauvegarde stack")
         temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-stack-"))
         try:
             images_dir = temp_dir / "images"
@@ -451,6 +606,7 @@ def backup_stack(stack_name, client=None):
             image_entries = {}
             container_entries = []
             for container in containers:
+                update_task(task_id, message=f"Sauvegarde image {container.image.short_id}")
                 image = container.image
                 image_id = image.id
                 if image_id not in image_entries:
@@ -499,6 +655,7 @@ def backup_stack(stack_name, client=None):
                 volume_name = volume.name
                 if not volume_name:
                     continue
+                update_task(task_id, message=f"Sauvegarde volume {volume_name}")
                 volume_tar_path = volumes_dir / f"{volume_name}.tar"
                 backup_volume_archive(volume_name, volume_tar_path, client, helper_image)
                 volume_attrs = volume.attrs or {}
@@ -529,15 +686,25 @@ def backup_stack(stack_name, client=None):
                     tar.add(volumes_dir, arcname="volumes")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        record_backup("stack", stack_name, str(file_path), "success")
+        update_task(task_id, progress=85, message="Chiffrement de la sauvegarde stack")
+        encrypted_file_path, encrypted = maybe_encrypt_backup(file_path)
+        record_backup("stack", stack_name, str(encrypted_file_path), "success")
         cleanup_old_backups(get_int_setting("backup_retention", 20), target_type="stack", target_name=stack_name)
-        run_drive_transfer(str(file_path))
+        run_drive_transfer(str(encrypted_file_path))
         send_alert("Sauvegarde stack réussie", f"Sauvegarde créée pour {stack_name}")
-        return True
+        update_task(
+            task_id,
+            status="success",
+            progress=100,
+            message="Sauvegarde stack terminée",
+            details="Sauvegarde chiffrée." if encrypted else "Sauvegarde terminée.",
+        )
+        return True, None
     except Exception as exc:
         record_backup("stack", stack_name, str(file_path), "failed", str(exc))
         send_alert("Sauvegarde stack échouée", f"Erreur pour {stack_name}: {exc}")
-        return False
+        update_task(task_id, status="failed", progress=100, message="Échec de la sauvegarde", details=str(exc))
+        return False, str(exc)
 
 
 def get_container_env(container):
@@ -578,7 +745,7 @@ def is_database_container(container):
     return False
 
 
-def backup_stack_with_db_pause(stack_name, client=None):
+def backup_stack_with_db_pause(stack_name, client=None, task_id=None):
     client = client or ensure_docker_client()
     if not client:
         raise docker.errors.DockerException(docker_unavailable_message())
@@ -598,7 +765,7 @@ def backup_stack_with_db_pause(stack_name, client=None):
                 log_docker_event(f"stack_backup_stop_db container={container.name} stack={stack_name}")
                 container.stop(timeout=10)
                 stopped_containers.append(container)
-        return backup_stack(stack_name, client=client)
+        return backup_stack(stack_name, client=client, task_id=task_id)
     finally:
         for container in stopped_containers:
             try:
@@ -611,7 +778,7 @@ def backup_stack_with_db_pause(stack_name, client=None):
                 )
 
 
-def backup_image(image_id, name=None, client=None):
+def backup_image(image_id, name=None, client=None, task_id=None):
     client = client or ensure_docker_client()
     if not client:
         raise docker.errors.DockerException(docker_unavailable_message())
@@ -619,19 +786,30 @@ def backup_image(image_id, name=None, client=None):
     filename = f"image-{name or image.short_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.tar"
     file_path = BACKUP_DIR / filename
     try:
+        update_task(task_id, status="running", progress=10, message="Sauvegarde de l'image")
         image_data = image.save(named=True)
         with open(file_path, "wb") as fh:
             for chunk in image_data:
                 fh.write(chunk)
-        record_backup("image", name or image.short_id, str(file_path), "success")
+        update_task(task_id, progress=85, message="Chiffrement de la sauvegarde image")
+        encrypted_file_path, encrypted = maybe_encrypt_backup(file_path)
+        record_backup("image", name or image.short_id, str(encrypted_file_path), "success")
         cleanup_old_backups(get_int_setting("backup_retention", 20), target_type="image")
-        run_drive_transfer(str(file_path))
+        run_drive_transfer(str(encrypted_file_path))
         send_alert("Sauvegarde image réussie", f"Sauvegarde créée pour {name or image.short_id}")
-        return True
+        update_task(
+            task_id,
+            status="success",
+            progress=100,
+            message="Sauvegarde image terminée",
+            details="Sauvegarde chiffrée." if encrypted else "Sauvegarde terminée.",
+        )
+        return True, None
     except Exception as exc:
         record_backup("image", name or image.short_id, str(file_path), "failed", str(exc))
         send_alert("Sauvegarde image échouée", f"Erreur pour {name or image.short_id}: {exc}")
-        return False
+        update_task(task_id, status="failed", progress=100, message="Échec de la sauvegarde", details=str(exc))
+        return False, str(exc)
 
 
 def import_container_backup(file_path, client=None):
@@ -1151,6 +1329,52 @@ def scheduled_container_backup(container_name, retention):
     backup_container(container.id, container.name, client=client, retention=retention)
 
 
+def scheduled_stack_backup(stack_name, retention, db_safe):
+    client = ensure_docker_client()
+    if not client:
+        return
+    if db_safe:
+        backup_stack_with_db_pause(stack_name, client=client)
+    else:
+        backup_stack(stack_name, client=client)
+
+
+def get_stack_schedules():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT stack_name, days, time, retention, db_safe FROM stack_schedules"
+        ).fetchall()
+    schedules = {}
+    for name, days, time_value, retention, db_safe in rows:
+        schedules[name] = {
+            "days": [day for day in days.split(",") if day],
+            "time": time_value,
+            "retention": retention,
+            "db_safe": bool(db_safe),
+        }
+    return schedules
+
+
+def set_stack_schedule(stack_name, days, time_value, retention, db_safe):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO stack_schedules (stack_name, days, time, retention, db_safe)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(stack_name) DO UPDATE SET days = excluded.days, time = excluded.time,
+            retention = excluded.retention, db_safe = excluded.db_safe
+            """,
+            (stack_name, ",".join(days), time_value, retention, int(db_safe)),
+        )
+        conn.commit()
+
+
+def delete_stack_schedule(stack_name):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM stack_schedules WHERE stack_name = ?", (stack_name,))
+        conn.commit()
+
+
 def get_container_schedules():
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -1208,6 +1432,27 @@ def refresh_scheduler():
                 f"schedule_invalid_time container={container_name} time={schedule['time']}",
                 logging.WARNING,
             )
+    stack_schedules = get_stack_schedules()
+    for stack_name, schedule in stack_schedules.items():
+        if not schedule["days"] or not schedule["time"]:
+            continue
+        try:
+            hour_str, minute_str = schedule["time"].split(":")
+            scheduler.add_job(
+                scheduled_stack_backup,
+                "cron",
+                day_of_week=",".join(schedule["days"]),
+                hour=int(hour_str),
+                minute=int(minute_str),
+                args=[stack_name, schedule["retention"], schedule["db_safe"]],
+                id=f"stack_backup_{stack_name}",
+                replace_existing=True,
+            )
+        except ValueError:
+            log_docker_event(
+                f"schedule_invalid_time stack={stack_name} time={schedule['time']}",
+                logging.WARNING,
+            )
 
 
 @app.route("/")
@@ -1226,6 +1471,7 @@ def dashboard():
         flash(docker_unavailable_message(), "error")
     containers, stacks, _ = split_containers_by_stack(containers)
     schedules = get_container_schedules()
+    stack_schedules = get_stack_schedules()
     week_days = [
         {"value": "mon", "label": "Lun"},
         {"value": "tue", "label": "Mar"},
@@ -1263,6 +1509,7 @@ def dashboard():
         stack_backups=stack_backups,
         latest_stack_backups=latest_stack_backups,
         schedules=schedules,
+        stack_schedules=stack_schedules,
         week_days=week_days,
         force_password_change=current_user.force_password_change,
     )
@@ -1354,6 +1601,142 @@ def logout():
     return redirect(url_for("login"))
 
 
+def start_task(title, target_type, target_name):
+    task_id = uuid.uuid4().hex
+    update_task(
+        task_id,
+        status="queued",
+        progress=0,
+        message=title,
+        target_type=target_type,
+        target_name=target_name,
+        started_at=datetime.utcnow().isoformat(),
+    )
+    return task_id
+
+
+def run_container_backup_task(task_id, container_id):
+    update_task(task_id, status="running", progress=2, message="Connexion à Docker")
+    client = ensure_docker_client()
+    if not client:
+        update_task(task_id, status="failed", progress=100, message="Docker indisponible", details=docker_unavailable_message())
+        return
+    try:
+        container = client.containers.get(container_id)
+        schedule = get_container_schedules().get(container.name, {})
+        retention = schedule.get("retention")
+        update_task(task_id, target_name=container.name)
+        success, error_message = backup_container(
+            container.id,
+            container.name,
+            client=client,
+            retention=retention,
+            task_id=task_id,
+        )
+        if not success:
+            update_task(task_id, status="failed", progress=100, details=error_message)
+    except Exception as exc:
+        update_task(task_id, status="failed", progress=100, message="Échec de la sauvegarde", details=str(exc))
+
+
+def run_stack_backup_task(task_id, stack_name, db_safe=False):
+    update_task(task_id, status="running", progress=2, message="Connexion à Docker")
+    client = ensure_docker_client()
+    if not client:
+        update_task(task_id, status="failed", progress=100, message="Docker indisponible", details=docker_unavailable_message())
+        return
+    try:
+        update_task(task_id, target_name=stack_name)
+        if db_safe:
+            success, error_message = backup_stack_with_db_pause(stack_name, client=client, task_id=task_id)
+        else:
+            success, error_message = backup_stack(stack_name, client=client, task_id=task_id)
+        if not success:
+            update_task(task_id, status="failed", progress=100, details=error_message)
+    except Exception as exc:
+        update_task(task_id, status="failed", progress=100, message="Échec de la sauvegarde", details=str(exc))
+
+
+def run_image_backup_task(task_id, image_id):
+    update_task(task_id, status="running", progress=2, message="Connexion à Docker")
+    client = ensure_docker_client()
+    if not client:
+        update_task(task_id, status="failed", progress=100, message="Docker indisponible", details=docker_unavailable_message())
+        return
+    try:
+        image = client.images.get(image_id)
+        name = image.tags[0] if image.tags else image.short_id
+        update_task(task_id, target_name=name)
+        success, error_message = backup_image(image.id, name, client=client, task_id=task_id)
+        if not success:
+            update_task(task_id, status="failed", progress=100, details=error_message)
+    except Exception as exc:
+        update_task(task_id, status="failed", progress=100, message="Échec de la sauvegarde", details=str(exc))
+
+
+def prepare_restore_file(file_path, task_id=None):
+    if not str(file_path).endswith(".enc"):
+        return Path(file_path), None
+    update_task(task_id, status="running", progress=10, message="Déchiffrement de la sauvegarde")
+    temp_dir = Path(tempfile.mkdtemp(prefix="sauvedocker-restore-dec-"))
+    decrypted_path = temp_dir / Path(file_path).with_suffix("").name
+    decrypt_file(file_path, decrypted_path, get_encryption_key())
+    return decrypted_path, temp_dir
+
+
+def run_restore_task(task_id, backup_id):
+    update_task(task_id, status="running", progress=2, message="Préparation de la restauration")
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT target_type, target_name, file_path FROM backups WHERE id = ?",
+            (backup_id,),
+        ).fetchone()
+    if not row:
+        update_task(task_id, status="failed", progress=100, message="Sauvegarde introuvable")
+        return
+    target_type, target_name, file_path = row
+    update_task(task_id, target_type=target_type, target_name=target_name)
+    client = ensure_docker_client()
+    if not client:
+        update_task(task_id, status="failed", progress=100, message="Docker indisponible", details=docker_unavailable_message())
+        return
+    temp_dir = None
+    try:
+        working_path, temp_dir = prepare_restore_file(file_path, task_id=task_id)
+        update_task(task_id, progress=40, message="Restauration en cours")
+        if target_type == "image":
+            with open(working_path, "rb") as fh:
+                client.images.load(fh.read())
+        elif target_type == "stack":
+            restore_stack_bundle(working_path, client=client)
+        else:
+            if tarfile.is_tarfile(working_path):
+                with tarfile.open(working_path, "r") as tar:
+                    if "manifest.json" in tar.getnames():
+                        restore_container_bundle(working_path, client=client)
+                        update_task(task_id, progress=90, message="Restauration du conteneur terminée")
+                        update_task(task_id, status="success", progress=100, message="Restauration terminée")
+                        return
+            image = import_container_backup(working_path, client=client)
+            image_config = image.attrs.get("Config") or {}
+            if target_name:
+                remove_existing_container(target_name, client=client)
+            if image_config.get("Cmd") or image_config.get("Entrypoint"):
+                client.containers.run(image.id, detach=True, name=target_name or None)
+        update_task(task_id, status="success", progress=100, message="Restauration terminée")
+    except Exception as exc:
+        update_task(task_id, status="failed", progress=100, message="Erreur de restauration", details=str(exc))
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@app.route("/tasks/<task_id>")
+@login_required
+def task_status_route(task_id):
+    return jsonify(get_task(task_id) or {"status": "unknown"})
+
+
 @app.route("/backup/container/<container_id>", methods=["POST"])
 @login_required
 def backup_container_route(container_id):
@@ -1365,7 +1748,12 @@ def backup_container_route(container_id):
         container = client.containers.get(container_id)
         schedule = get_container_schedules().get(container.name, {})
         retention = schedule.get("retention")
-        success = backup_container(container.id, container.name, client=client, retention=retention)
+        success, error_message = backup_container(
+            container.id,
+            container.name,
+            client=client,
+            retention=retention,
+        )
     except docker.errors.DockerException as exc:
         reset_docker_client(str(exc))
         flash(docker_unavailable_message(), "error")
@@ -1373,8 +1761,17 @@ def backup_container_route(container_id):
     if success:
         flash("Sauvegarde du conteneur créée.", "success")
     else:
-        flash("Échec de la sauvegarde du conteneur.", "error")
+        flash(f"Échec de la sauvegarde du conteneur. {error_message}", "error")
     return redirect(url_for("dashboard"))
+
+
+@app.route("/tasks/backup/container/<container_id>", methods=["POST"])
+@login_required
+def backup_container_task_route(container_id):
+    task_id = start_task("Sauvegarde conteneur", "container", container_id)
+    thread = threading.Thread(target=run_container_backup_task, args=(task_id, container_id), daemon=True)
+    thread.start()
+    return jsonify({"task_id": task_id})
 
 
 @app.route("/backup/stack/<stack_name>", methods=["POST"])
@@ -1385,7 +1782,7 @@ def backup_stack_route(stack_name):
         flash(docker_unavailable_message(), "error")
         return redirect(url_for("dashboard"))
     try:
-        success = backup_stack(stack_name, client=client)
+        success, error_message = backup_stack(stack_name, client=client)
     except docker.errors.DockerException as exc:
         reset_docker_client(str(exc))
         flash(docker_unavailable_message(), "error")
@@ -1393,8 +1790,17 @@ def backup_stack_route(stack_name):
     if success:
         flash("Sauvegarde de la stack créée.", "success")
     else:
-        flash("Échec de la sauvegarde de la stack.", "error")
+        flash(f"Échec de la sauvegarde de la stack. {error_message}", "error")
     return redirect(url_for("dashboard"))
+
+
+@app.route("/tasks/backup/stack/<stack_name>", methods=["POST"])
+@login_required
+def backup_stack_task_route(stack_name):
+    task_id = start_task("Sauvegarde stack", "stack", stack_name)
+    thread = threading.Thread(target=run_stack_backup_task, args=(task_id, stack_name, False), daemon=True)
+    thread.start()
+    return jsonify({"task_id": task_id})
 
 
 @app.route("/backup/stack/<stack_name>/db-safe", methods=["POST"])
@@ -1405,7 +1811,7 @@ def backup_stack_db_safe_route(stack_name):
         flash(docker_unavailable_message(), "error")
         return redirect(url_for("dashboard"))
     try:
-        success = backup_stack_with_db_pause(stack_name, client=client)
+        success, error_message = backup_stack_with_db_pause(stack_name, client=client)
     except docker.errors.DockerException as exc:
         reset_docker_client(str(exc))
         flash(docker_unavailable_message(), "error")
@@ -1413,8 +1819,17 @@ def backup_stack_db_safe_route(stack_name):
     if success:
         flash("Sauvegarde stack avec arrêt DB créée.", "success")
     else:
-        flash("Échec de la sauvegarde stack avec arrêt DB.", "error")
+        flash(f"Échec de la sauvegarde stack avec arrêt DB. {error_message}", "error")
     return redirect(url_for("dashboard"))
+
+
+@app.route("/tasks/backup/stack/<stack_name>/db-safe", methods=["POST"])
+@login_required
+def backup_stack_db_safe_task_route(stack_name):
+    task_id = start_task("Sauvegarde stack (arrêt DB)", "stack", stack_name)
+    thread = threading.Thread(target=run_stack_backup_task, args=(task_id, stack_name, True), daemon=True)
+    thread.start()
+    return jsonify({"task_id": task_id})
 
 
 @app.route("/backup/image/<image_id>", methods=["POST"])
@@ -1427,7 +1842,7 @@ def backup_image_route(image_id):
     try:
         image = client.images.get(image_id)
         name = image.tags[0] if image.tags else image.short_id
-        success = backup_image(image.id, name, client=client)
+        success, error_message = backup_image(image.id, name, client=client)
     except docker.errors.DockerException as exc:
         reset_docker_client(str(exc))
         flash(docker_unavailable_message(), "error")
@@ -1435,8 +1850,17 @@ def backup_image_route(image_id):
     if success:
         flash("Sauvegarde de l'image créée.", "success")
     else:
-        flash("Échec de la sauvegarde de l'image.", "error")
+        flash(f"Échec de la sauvegarde de l'image. {error_message}", "error")
     return redirect(url_for("dashboard"))
+
+
+@app.route("/tasks/backup/image/<image_id>", methods=["POST"])
+@login_required
+def backup_image_task_route(image_id):
+    task_id = start_task("Sauvegarde image", "image", image_id)
+    thread = threading.Thread(target=run_image_backup_task, args=(task_id, image_id), daemon=True)
+    thread.start()
+    return jsonify({"task_id": task_id})
 
 
 @app.route("/restore", methods=["POST"])
@@ -1456,25 +1880,27 @@ def restore_backup():
     if not client:
         flash(docker_unavailable_message(), "error")
         return redirect(url_for("dashboard"))
+    temp_dir = None
     try:
+        working_path, temp_dir = prepare_restore_file(file_path)
         if target_type == "image":
-            with open(file_path, "rb") as fh:
+            with open(working_path, "rb") as fh:
                 client.images.load(fh.read())
         elif target_type == "stack":
-            restore_stack_bundle(file_path, client=client)
+            restore_stack_bundle(working_path, client=client)
             flash("Restauration de la stack déclenchée.", "success")
             return redirect(url_for("dashboard"))
         else:
-            if tarfile.is_tarfile(file_path):
-                with tarfile.open(file_path, "r") as tar:
+            if tarfile.is_tarfile(working_path):
+                with tarfile.open(working_path, "r") as tar:
                     if "manifest.json" in tar.getnames():
-                        removed_existing = restore_container_bundle(file_path, client=client)
+                        removed_existing = restore_container_bundle(working_path, client=client)
                         if removed_existing:
                             flash("Conteneur existant supprimé. Restauration déclenchée.", "success")
                         else:
                             flash("Restauration déclenchée.", "success")
                         return redirect(url_for("dashboard"))
-            image = import_container_backup(file_path, client=client)
+            image = import_container_backup(working_path, client=client)
             image_config = image.attrs.get("Config") or {}
             removed_existing = False
             if target_name:
@@ -1494,7 +1920,22 @@ def restore_backup():
         flash(docker_unavailable_message(), "error")
     except Exception as exc:
         flash(f"Erreur de restauration: {exc}", "error")
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
     return redirect(url_for("dashboard"))
+
+
+@app.route("/tasks/restore", methods=["POST"])
+@login_required
+def restore_backup_task_route():
+    backup_id = request.form.get("backup_id")
+    if not backup_id:
+        return jsonify({"error": "backup_id manquant"}), 400
+    task_id = start_task("Restauration sauvegarde", "restore", backup_id)
+    thread = threading.Thread(target=run_restore_task, args=(task_id, backup_id), daemon=True)
+    thread.start()
+    return jsonify({"task_id": task_id})
 
 
 @app.route("/schedule/container/<container_id>", methods=["POST"])
@@ -1535,6 +1976,34 @@ def schedule_container(container_id):
     return redirect(url_for("dashboard"))
 
 
+@app.route("/schedule/stack/<stack_name>", methods=["POST"])
+@login_required
+def schedule_stack(stack_name):
+    if request.form.get("disable"):
+        delete_stack_schedule(stack_name)
+        refresh_scheduler()
+        flash("Planification stack désactivée.", "success")
+        return redirect(url_for("dashboard"))
+
+    days = request.form.getlist("days")
+    time_value = request.form.get("time", "").strip()
+    retention_raw = request.form.get("retention", "").strip()
+    db_safe = bool(request.form.get("db_safe"))
+    if not days or not time_value:
+        delete_stack_schedule(stack_name)
+        refresh_scheduler()
+        flash("Planification stack désactivée (jour ou heure manquante).", "warning")
+        return redirect(url_for("dashboard"))
+    try:
+        retention = max(0, int(retention_raw or 0))
+    except ValueError:
+        retention = get_int_setting("backup_retention", 20)
+    set_stack_schedule(stack_name, days, time_value, retention, db_safe)
+    refresh_scheduler()
+    flash("Planification stack enregistrée.", "success")
+    return redirect(url_for("dashboard"))
+
+
 @app.route("/download/<path:filename>")
 @login_required
 def download_backup(filename):
@@ -1572,6 +2041,7 @@ def delete_backup():
 def settings():
     if request.method == "POST":
         set_setting("backup_retention", request.form.get("backup_retention", "20"))
+        set_setting("backup_encryption_key", request.form.get("backup_encryption_key"))
         set_setting("smtp_host", request.form.get("smtp_host"))
         set_setting("smtp_port", request.form.get("smtp_port"))
         set_setting("smtp_user", request.form.get("smtp_user"))
@@ -1584,6 +2054,7 @@ def settings():
         return redirect(url_for("settings"))
     context = {
         "backup_retention": get_setting("backup_retention", "20"),
+        "backup_encryption_key": get_setting("backup_encryption_key", ""),
         "smtp_host": get_setting("smtp_host", ""),
         "smtp_port": get_setting("smtp_port", ""),
         "smtp_user": get_setting("smtp_user", ""),
