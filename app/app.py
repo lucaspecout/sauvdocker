@@ -19,6 +19,7 @@ from logging.handlers import RotatingFileHandler
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory, jsonify
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 import docker
 from requests.exceptions import InvalidURL
@@ -178,6 +179,13 @@ def ensure_docker_client():
 
 def docker_unavailable_message():
     return docker_error or "Docker indisponible."
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_upload(error):
+    if request.path.startswith("/tasks/"):
+        return jsonify({"error": "Fichier trop volumineux."}), 413
+    return "Fichier trop volumineux.", 413
 
 scheduler = BackgroundScheduler()
 task_status = {}
@@ -2110,25 +2118,30 @@ def download_backup(filename):
 @app.route("/tasks/backup/import", methods=["POST"])
 @login_required
 def import_backup_task_route():
-    uploaded = request.files.get("backup_file")
-    target_type = request.form.get("target_type", "auto")
-    if not uploaded or not uploaded.filename:
-        return jsonify({"error": "Fichier de sauvegarde manquant."}), 400
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    filename = secure_filename(uploaded.filename)
-    if not filename:
-        filename = f"backup-{uuid.uuid4().hex}"
-    destination = BACKUP_DIR / filename
-    if destination.exists():
-        destination = BACKUP_DIR / f"{destination.stem}-{uuid.uuid4().hex}{destination.suffix}"
     try:
+        uploaded = request.files.get("backup_file")
+        target_type = request.form.get("target_type", "auto")
+        if not uploaded or not uploaded.filename:
+            return jsonify({"error": "Fichier de sauvegarde manquant."}), 400
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        filename = secure_filename(uploaded.filename)
+        if not filename:
+            filename = f"backup-{uuid.uuid4().hex}"
+        destination = BACKUP_DIR / filename
+        if destination.exists():
+            destination = BACKUP_DIR / f"{destination.stem}-{uuid.uuid4().hex}{destination.suffix}"
         uploaded.save(destination)
+        task_id = start_task("Import sauvegarde", "import", filename)
+        thread = threading.Thread(target=run_import_task, args=(task_id, destination, target_type), daemon=True)
+        thread.start()
+        return jsonify({"task_id": task_id})
+    except RequestEntityTooLarge:
+        raise
     except OSError as exc:
         return jsonify({"error": f"Impossible d'enregistrer le fichier: {exc}"}), 500
-    task_id = start_task("Import sauvegarde", "import", filename)
-    thread = threading.Thread(target=run_import_task, args=(task_id, destination, target_type), daemon=True)
-    thread.start()
-    return jsonify({"task_id": task_id})
+    except Exception as exc:
+        log_docker_event(f"backup_import_error error={exc}", logging.ERROR)
+        return jsonify({"error": f"Erreur lors de l'import: {exc}"}), 500
 
 
 @app.route("/backup/delete", methods=["POST"])
