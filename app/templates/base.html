@@ -110,6 +110,22 @@
       }
     });
 
+    const readJsonResponse = async (response) => {
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        const text = await response.text();
+        return {
+          error: text ? text.slice(0, 500) : "Réponse vide du serveur",
+          _raw: text,
+        };
+      }
+      try {
+        return await response.json();
+      } catch (error) {
+        return { error: `Réponse JSON invalide: ${error}` };
+      }
+    };
+
     document.querySelectorAll("form.async-task").forEach((form) => {
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -122,7 +138,15 @@
             method: form.method || "POST",
             body: new FormData(form),
           });
-          const data = await response.json();
+          const data = await readJsonResponse(response);
+          if (!response.ok) {
+            updateOverlay({
+              message: "Erreur",
+              details: data.error || `Statut ${response.status}`,
+              progress: 100,
+            });
+            return;
+          }
           if (!data.task_id) {
             updateOverlay({ message: "Erreur", details: data.error || "Impossible de démarrer la tâche", progress: 100 });
             return;
