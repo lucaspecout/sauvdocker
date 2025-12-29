@@ -1045,6 +1045,7 @@ def restore_stack_bundle(file_path, client=None):
                 helper_container.remove(force=True)
         for network_entry in network_entries:
             ensure_network(client, network_entry)
+        stack_network_names = {entry.get("name") for entry in network_entries if entry.get("name")}
         for container_entry in manifest.get("containers", []):
             container_name = container_entry.get("name")
             config = container_entry.get("config", {})
@@ -1082,7 +1083,17 @@ def restore_stack_bundle(file_path, client=None):
             container.start()
             container_networks = container_entry.get("networks") or []
             if not container_networks and network_entries:
-                container_networks = network_entries
+                container_networks = list(network_entries)
+            elif stack_network_names:
+                container_network_names = {
+                    entry.get("name") for entry in container_networks if entry.get("name")
+                }
+                if not (container_network_names & stack_network_names):
+                    for network_entry in network_entries:
+                        network_name = network_entry.get("name")
+                        if network_name and network_name not in container_network_names:
+                            container_networks.append({"name": network_name})
+                            container_network_names.add(network_name)
             for network_entry in container_networks:
                 network_name = network_entry.get("name")
                 if not network_name or network_name in ("bridge", "host", "none"):
